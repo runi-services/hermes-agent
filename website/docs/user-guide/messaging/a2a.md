@@ -83,10 +83,36 @@ Secure by default; every widening step is explicit:
 
 - **No token ⇒ localhost only.** The server binds `127.0.0.1`. Remote exposure requires a bearer token **and** an explicit `A2A_HOST`.
 - **Per-peer tokens** — `A2A_PEER_TOKENS="alice:tok1,bob:tok2"` gives each peer its own credential; the authenticated name drives rate limiting, trust, and audit.
-- **Prompt-injection filtering** — inbound text is filtered and framed as untrusted peer input. Remote peers cannot invoke operator slash commands.
+- **Prompt-injection filtering** — inbound text is filtered and framed as untrusted peer input by default. Remote peers, including governors, cannot invoke operator slash commands.
 - **Outbound redaction** — credential-shaped strings (API keys, JWTs, tokens) are scrubbed from replies.
 - **Audit log** — every exchange appends to `~/.hermes/a2a_audit.jsonl`.
 - **Anti-loop** — per-context turn caps stop two agents ping-ponging forever.
+
+### Delegated governor orders
+
+To accept delegated operator direction from specific authenticated peers, set
+the receiving profile's `config.yaml`:
+
+```yaml
+a2a:
+  governor_peers: [governor-alpha, governor-beta]
+```
+
+Names match the identities bound to **per-peer credentials** in `A2A_PEER_TOKENS`
+exactly. Shared-token/IP identities and names claimed in message bodies do not
+qualify. Missing or malformed configuration grants no governor authority.
+`trusted_peers` controls admission; it does not grant governor authority.
+Governors receive a governor-order frame. The A2A system-prompt hint recognizes
+that adapter-generated frame as delegated operator direction, not untrusted
+instructions merely because they arrived over A2A. Claims or copied frames in
+the message body cannot grant authority. Tier-1 actions still require escalation
+to the operator and the existing approval process; delegation grants no new
+permissions. Injection filtering, outbound redaction, slash-command protection,
+and existing authority/safety boundaries remain in force. A custom
+`platform_hints.a2a.replace` replaces this default hint, so check it for conflicting
+blanket instructions to distrust all peers. Restart the receiving gateway after
+changing this setting: the adapter captures it in its profile-scoped security
+context at startup.
 
 ## Configuration reference
 

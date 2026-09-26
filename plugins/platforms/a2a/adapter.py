@@ -542,7 +542,7 @@ class A2AAdapter(BasePlatformAdapter):
                                   f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.")
         if not text:
             return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
-        framed = security.wrap_inbound(peer, text)
+        framed = security.wrap_inbound(peer, text, context=self._security_context)
         security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
