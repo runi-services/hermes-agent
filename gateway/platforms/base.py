@@ -2494,6 +2494,9 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # True when the transport may have accepted the message but did not return
+    # a verifiable receipt. Retrying or sending a fallback could duplicate it.
+    delivery_ambiguous: bool = False
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -5556,6 +5559,14 @@ class BasePlatformAdapter(ABC):
         )
 
         if result.success:
+            return result
+
+        if result.delivery_ambiguous:
+            logger.error(
+                "[%s] Delivery outcome is ambiguous; refusing retry or fallback: %s",
+                self.name,
+                result.error or "missing delivery receipt",
+            )
             return result
 
         error_str = result.error or ""

@@ -385,6 +385,43 @@ class TestTeamsSend:
         assert result.message_id == "msg-123"
         mock_app.send.assert_awaited_once_with("conv-id", "Hello")
 
+    @pytest.mark.anyio
+    async def test_send_uses_teams_limit_for_6286_character_message(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        mock_result = MagicMock(id="msg-6286")
+        mock_app = MagicMock()
+        mock_app.send = AsyncMock(return_value=mock_result)
+        adapter._app = mock_app
+        content = "x" * 6286
+
+        result = await adapter.send("conv-id", content)
+
+        assert result.success is True
+        assert result.message_id == "msg-6286"
+        mock_app.send.assert_awaited_once_with("conv-id", content)
+
+    @pytest.mark.anyio
+    async def test_send_without_activity_id_fails_loud(self, caplog):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        mock_app = MagicMock()
+        mock_app.send = AsyncMock(return_value=SimpleNamespace(id=None))
+        adapter._app = mock_app
+
+        result = await adapter._send_with_retry(
+            "conv-id", "Hello", max_retries=0
+        )
+
+        assert result.success is False
+        assert result.retryable is False
+        assert result.delivery_ambiguous is True
+        assert "without activity id" in str(result.error)
+        assert "without activity id" in caplog.text
+        mock_app.send.assert_awaited_once_with("conv-id", "Hello")
+
 
 def _make_summary_payload():
     return TeamsMeetingSummaryPayload(

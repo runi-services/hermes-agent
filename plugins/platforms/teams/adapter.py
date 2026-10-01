@@ -1226,7 +1226,9 @@ class TeamsAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Teams app not initialized")
 
         formatted = self.format_message(content)
-        chunks = self.truncate_message(formatted)
+        chunks = self.truncate_message(
+            formatted, max_length=self.MAX_MESSAGE_LENGTH
+        )
         last_message_id = None
 
         for chunk in chunks:
@@ -1246,6 +1248,15 @@ class TeamsAdapter(BasePlatformAdapter):
                 else:
                     result = await self._app.send(chat_id, chunk)
                 last_message_id = getattr(result, "id", None)
+                if not last_message_id:
+                    error = "Teams connector accepted send without activity id"
+                    logger.error("[teams] %s", error)
+                    return SendResult(
+                        success=False,
+                        error=error,
+                        retryable=False,
+                        delivery_ambiguous=True,
+                    )
             except Exception as e:
                 return SendResult(success=False, error=str(e), retryable=True)
 
