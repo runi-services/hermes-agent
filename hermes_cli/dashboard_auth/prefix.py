@@ -230,3 +230,16 @@ def resolve_public_url() -> str:
     if not cfg_clean:
         _warn_if_malformed("dashboard.public_url in config.yaml", cfg_raw)
     return cfg_clean
+
+
+def public_url_path_prefix() -> str:
+    """Return the path prefix declared by ``dashboard.public_url``.
+
+    ``public_url`` is the authoritative external address.  Reverse proxies
+    often strip its path before forwarding, so callback redirects cannot
+    recover that path from ``request.url`` alone.
+    """
+    public_url = resolve_public_url()
+    if not public_url:
+        return ""
+    return normalise_prefix(urllib.parse.urlparse(public_url).path)

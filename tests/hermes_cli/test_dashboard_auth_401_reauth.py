@@ -483,6 +483,23 @@ class TestAuthCallbackNext:
         assert r.status_code == 302
         assert r.headers["location"] == "/sessions"
 
+    def test_callback_uses_public_url_path_prefix(
+        self, gated_app, monkeypatch
+    ):
+        """A prefixed public_url is the redirect source of truth.
+
+        Reverse proxies commonly strip the external prefix before the request
+        reaches FastAPI.  The callback must still land inside that prefix,
+        rather than emitting ``Location: /`` and escaping the mapped API.
+        """
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_PUBLIC_URL",
+            "https://dashboard.example.test/hermes",
+        )
+        r = self._drive_oauth_via_login(gated_app)
+        assert r.status_code == 302
+        assert r.headers["location"] == "/hermes/"
+
 
     def test_attacker_callback_next_param_is_ignored(self, gated_app):
         """Hardening: even if an attacker crafts a callback URL with a

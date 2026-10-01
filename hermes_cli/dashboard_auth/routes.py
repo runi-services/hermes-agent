@@ -588,6 +588,19 @@ async def auth_callback(
     # that lets attacker-controlled bytes into the cookie would otherwise
     # produce an open redirect.
     landing = _validate_post_login_target(next_from_cookie) or "/"
+    # Keep the browser inside a reverse-proxy mount after the OAuth callback.
+    # APIM/nginx commonly strip the external prefix before forwarding, so a
+    # bare ``Location: /`` escapes the mapped dashboard and lands on the
+    # public host root.  Prefer the configured public URL (the operator's
+    # source of truth), with X-Forwarded-Prefix as the compatibility fallback.
+    from hermes_cli.dashboard_auth.prefix import public_url_path_prefix
+
+    external_prefix = public_url_path_prefix() or _prefix(request)
+    if external_prefix and not (
+        landing == external_prefix
+        or landing.startswith(f"{external_prefix}/")
+    ):
+        landing = f"{external_prefix}{landing}"
     resp = RedirectResponse(url=landing, status_code=302)
     set_session_cookies(
         resp,
