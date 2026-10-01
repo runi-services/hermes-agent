@@ -2647,6 +2647,18 @@ class MCPServerTask:
                 )
         return _on_log
 
+    def _make_notification_bindings(self) -> Dict[str, Any]:
+        """Return plugin-owned MCP 2.0 notification bindings for this server."""
+        try:
+            if "notification_bindings" not in inspect.signature(ClientSession).parameters:
+                return {}
+            from hermes_cli.plugins import get_plugin_manager
+
+            bindings = get_plugin_manager().get_mcp_notification_handlers(self.name)
+        except (ImportError, ModuleNotFoundError, TypeError, ValueError):
+            return {}
+        return {"notification_bindings": bindings} if bindings else {}
+
     def _make_message_handler(self):
         """Build a ``message_handler`` callback for ``ClientSession``.
 
@@ -3077,6 +3089,7 @@ class MCPServerTask:
             sampling_kwargs["message_handler"] = self._make_message_handler()
         if _MCP_LOGGING_CALLBACK_SUPPORTED:
             sampling_kwargs["logging_callback"] = self._make_logging_callback()
+        sampling_kwargs.update(self._make_notification_bindings())
 
         # Reap any orphaned subprocesses from prior failed connection
         # attempts before spawning a new one.  Without this, each retry in
@@ -3440,6 +3453,7 @@ class MCPServerTask:
             sampling_kwargs["message_handler"] = self._make_message_handler()
         if _MCP_LOGGING_CALLBACK_SUPPORTED:
             sampling_kwargs["logging_callback"] = self._make_logging_callback()
+        sampling_kwargs.update(self._make_notification_bindings())
 
         # SSE transport (for MCP servers that implement the SSE transport protocol
         # rather than Streamable HTTP). Configure with ``transport: sse`` in the

@@ -1098,6 +1098,55 @@ The canonical list of kinds is `VALID_MIDDLEWARE` in `hermes_cli/middleware.py`:
 - Middleware payloads carry `middleware_schema_version` (`hermes.middleware.v1`) alongside the observer telemetry fields.
 - Unknown kinds register with a warning instead of failing, so a plugin written against a newer Hermes still loads on an older one.
 
+### Receive custom MCP notifications
+
+MCP 2.0 servers may send application-specific notifications to a plugin through the
+host-owned MCP connection:
+
+```python
+from pydantic import BaseModel
+
+class BuildFinished(BaseModel):
+    content: str
+
+def register(ctx):
+    trusted_session_key = ctx.get_config("session_key")
+
+    async def on_finished(params: BuildFinished):
+        if trusted_session_key:
+            ctx.inject_message(params.content, session_key=trusted_session_key)
+
+    ctx.register_mcp_notification_handler(
+        "builds", "notifications/build/finished", BuildFinished, on_finished
+    )
+```
+
+`register_mcp_notification_handler(server, method, params_type, callback)` returns a
+tracked `PluginRegistration`. `server` and `method` must be non-empty,
+`params_type` must provide `model_validate`, and `callback` must be async. Hermes
+allows one owner for each exact `(server, method)` pair and removes the binding when
+the plugin unloads. The callback receives the validated model, not the raw mapping.
+
+Both grants below are required for the example:
+
+```yaml
+plugins:
+  entries:
+    my-plugin:
+      mcp_allowlist: [builds]       # permit this plugin to bind that MCP server
+      allow_gateway_injection: true # permit ctx.inject_message into gateway sessions
+      settings:
+        session_key: agent:main:telegram:dm:42
+```
+
+Both gates default to deny. `ctx.inject_message` also requires an exact existing
+`session_key`; the trusted integration callback must resolve or configure that key
+itself rather than treating an arbitrary notification field as routing authority.
+Injection continues through the normal gateway inbound authorization and routing
+path. Registering a notification handler does not bypass that gate. Bindings are
+snapshotted when an MCP client session starts, so a newly registered handler needs a
+new connection or reconnect; unloading immediately makes an old snapshot inert.
+
 ### Register CLI commands
 
 Plugins can add their own `hermes <plugin>` subcommand tree:

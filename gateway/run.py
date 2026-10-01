@@ -30451,6 +30451,19 @@ def _gateway_stderr_formatter() -> logging.Formatter:
     return RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
+async def _discover_gateway_plugins_and_mcp() -> None:
+    """Register plugin notification bindings before MCP sessions snapshot them."""
+    from hermes_cli.plugins import discover_plugins
+    from tools.mcp_tool import discover_mcp_tools
+
+    def discover_runtime() -> object:
+        discover_plugins()
+        return discover_mcp_tools()
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, discover_runtime)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -30924,16 +30937,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # MCP tool discovery — run in an executor so the asyncio event loop
     # stays responsive even when a configured MCP server is slow or
-    # unreachable.  discover_mcp_tools() uses a blocking 120s wait
-    # internally; calling it from the loop thread would freeze platform
-    # heartbeats (Discord shard, Telegram polling) until it returned.
-    # See #16856.
+    # unreachable. Notification bindings must be registered first because
+    # ClientSession snapshots them when the connection opens.
     try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
+        await _discover_gateway_plugins_and_mcp()
     except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
+        logger.debug("Plugin/MCP discovery failed: %s", e)
 
     # Start the gateway
     try:

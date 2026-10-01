@@ -657,6 +657,22 @@ The new filtering support is also a security control:
 - expose only a minimal whitelist for a sensitive server
 - disable resource/prompt wrappers when you do not want that surface exposed
 
+### Plugin custom notifications
+
+Native plugins can bind an MCP 2.0 custom notification with
+`ctx.register_mcp_notification_handler(server, method, params_type, callback)`.
+The plugin must be explicitly granted the exact server under
+`plugins.entries.<plugin-id>.mcp_allowlist`; a missing or malformed allowlist denies
+registration. If the async callback uses `ctx.inject_message` to start a turn in an
+existing gateway conversation, the same plugin also needs
+`plugins.entries.<plugin-id>.allow_gateway_injection: true` and must supply that
+conversation's exact `session_key`. Both gates default to deny, and injection still
+uses the normal gateway inbound path. The trusted integration callback must resolve
+or configure the session key; a notification payload is not automatically trusted
+as routing authority. Registrations apply when the MCP connection is next created
+or reconnected. See [Build a Plugin](/developer-guide/plugins#receive-custom-mcp-notifications)
+for the typed callback example.
+
 ## Example use cases
 
 ### GitHub server with a minimal issue-management surface

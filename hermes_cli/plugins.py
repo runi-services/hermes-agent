@@ -1935,6 +1935,77 @@ class PluginContext:
             return []
         return [str(item) for item in allowlist]
 
+    # -- MCP notification registration -------------------------------------
+
+    def register_mcp_notification_handler(
+        self, server: str, method: str, params_type: type, callback: Callable,
+    ) -> PluginRegistration:
+        """Register one typed MCP server notification handler.
+
+        Registration is default-deny through ``mcp_allowlist``. Plugins decide
+        what a valid notification means; gateway delivery should call
+        :meth:`inject_message` so the existing session and injection gates stay
+        authoritative.
+        """
+        plugin_id = self.manifest.key or self.manifest.name
+        if not isinstance(server, str) or not server.strip():
+            raise ValueError("MCP notification server must be a non-empty string")
+        if not isinstance(method, str) or not method.strip():
+            raise ValueError("MCP notification method must be a non-empty string")
+        if server not in self._mcp_allowlist(plugin_id):
+            raise PermissionError(
+                f"Plugin {self.manifest.name!r} is not allowed to receive MCP "
+                f"notifications from server {server!r}. Add it to "
+                f"plugins.entries.{plugin_id}.mcp_allowlist in config.yaml "
+                f"to grant access (default is no MCP access)."
+            )
+        if not isinstance(params_type, type) or not callable(
+            getattr(params_type, "model_validate", None)
+        ):
+            raise TypeError("MCP notification params_type must support model_validate()")
+        if not inspect.iscoroutinefunction(callback):
+            raise TypeError("MCP notification callback must be an async function")
+
+        key = (server, method)
+        handlers = self._manager._mcp_notification_handlers
+        with (
+            self._manager._discovery_lock,
+            replacement_coordinator.transaction(),
+            self._manager._mcp_notification_lock,
+        ):
+            current = handlers.get(key)
+            if current is not None:
+                raise ValueError(
+                    f"MCP notification handler already registered for "
+                    f"{server!r} / {method!r} by plugin {current[0]!r}"
+                )
+            entry = (plugin_id, params_type, callback)
+            handlers[key] = entry
+
+            def restore(previous):
+                with self._manager._mcp_notification_lock:
+                    if handlers.get(key) is not entry:
+                        return False
+                    if previous is None:
+                        handlers.pop(key, None)
+                    else:
+                        handlers[key] = previous
+                    return True
+
+            return self._track_replacement(
+                "mcp_notification_handler",
+                f"{server}:{method}",
+                slot=(
+                    "mcp_notification_handler",
+                    self._manager.scope_key,
+                    server,
+                    method,
+                ),
+                current=entry,
+                previous=None,
+                restore=restore,
+            )
+
     # -- override trust gate ------------------------------------------------
 
     def _tool_override_allowed(self, tool_name: str) -> bool:
@@ -3415,6 +3486,10 @@ class PluginManager:
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
         self._portable_mcp_servers: Dict[str, Dict[str, Any]] = {}
+        self._mcp_notification_handlers: Dict[
+            tuple[str, str], tuple[str, type, Callable]
+        ] = {}
+        self._mcp_notification_lock = threading.RLock()
         # Plugin-registered auxiliary tasks: key → {key, display_name,
         # description, defaults, plugin}. See PluginContext.register_auxiliary_task.
         self._aux_tasks: Dict[str, Dict[str, Any]] = {}
@@ -3467,6 +3542,37 @@ class PluginManager:
         # full plugin loads.
         self._predeclared_modules: Dict[str, types.ModuleType] = {}
         self._predeclared_tools: Dict[str, List[str]] = {}
+
+    def get_mcp_notification_handlers(self, server: str) -> List[Any]:
+        """Return MCP 2.0 ``NotificationBinding`` values for one server."""
+        try:
+            from mcp.client.extension import NotificationBinding
+        except (ImportError, ModuleNotFoundError):
+            return []
+
+        bindings = []
+        with self._mcp_notification_lock:
+            entries = list(self._mcp_notification_handlers.items())
+        for key, entry in entries:
+            entry_server, method = key
+            if entry_server != server:
+                continue
+            _plugin_id, params_type, callback = entry
+
+            async def dispatch(params, *, _key=key, _entry=entry):
+                with self._mcp_notification_lock:
+                    active = self._mcp_notification_handlers.get(_key) is _entry
+                if active:
+                    await _entry[2](params)
+
+            bindings.append(
+                NotificationBinding(
+                    method=method,
+                    params_type=params_type,
+                    handler=dispatch,
+                )
+            )
+        return bindings
 
     # -----------------------------------------------------------------------
     # Registration ledger internals
@@ -3726,6 +3832,8 @@ class PluginManager:
             self._plugin_commands.clear()
             self._plugin_skills.clear()
             self._portable_mcp_servers.clear()
+            with self._mcp_notification_lock:
+                self._mcp_notification_handlers.clear()
             self._aux_tasks.clear()
             self._system_prompt_sections.clear()
             self._approval_transports.clear()
