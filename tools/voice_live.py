@@ -91,11 +91,8 @@ def voice_live_turn_note(context: str = "") -> str:
 
 
 def _voice_section() -> Dict[str, Any]:
-    try:
-        from hermes_cli.config import load_config
-        voice = load_config().get("voice")
-    except Exception:
-        return {}
+    from hermes_cli.config import load_config
+    voice = load_config().get("voice")
     return voice if isinstance(voice, dict) else {}
 
 
@@ -112,14 +109,36 @@ def voice_chat_mode(voice: Optional[Dict[str, Any]] = None) -> str:
 
 
 def _resolve_credentials(live: Dict[str, Any]) -> tuple[str, str]:
-    """``(api_key, base_url)`` — ``voice.gpt_live.api_key`` first, else the same OpenAI audio
-    chain the STT/TTS providers use (``VOICE_TOOLS_OPENAI_KEY`` → ``OPENAI_API_KEY`` → pool).
-
-    The Nous-managed audio proxy does not carry ``/live/sessions``; this mode is direct-key only.
+    """Resolve a server-local key path first. Azure requires the path and its own endpoint,
+    with no OpenAI credential fallback. Legacy OpenAI callers retain their audio key chain.
+    The Nous-managed audio proxy does not carry ``/live/sessions``.
     """
-    from tools.tool_backend_helpers import resolve_openai_audio_api_key
-    api_key = str(live.get("api_key") or "").strip() or resolve_openai_audio_api_key()
-    base_url = str(live.get("base_url") or DEFAULT_LIVE_BASE_URL).strip().rstrip("/")
+    from pathlib import Path
+    from urllib.parse import urlsplit
+
+    provider = str(live.get("provider") or "openai").strip().lower()
+    if provider not in {"openai", "azure"}:
+        raise ValueError("Unsupported GPT-Live provider")
+    base_url = str(live.get("base_url") or (DEFAULT_LIVE_BASE_URL if provider == "openai" else "")).strip().rstrip("/")
+    key_file = str(live.get("api_key_file") or "").strip()
+    if provider == "azure":
+        url = urlsplit(base_url)
+        if (url.scheme != "https" or not (url.hostname or "").endswith(".openai.azure.com")
+                or url.path != "/openai/v1" or url.username or url.password or url.port
+                or url.query or url.fragment):
+            raise ValueError("Azure GPT-Live needs an HTTPS Azure OpenAI /openai/v1 base_url")
+        if not key_file:
+            raise ValueError("Azure GPT-Live needs voice.gpt_live.api_key_file; no OpenAI fallback")
+    if key_file:
+        try:
+            api_key = Path(key_file).expanduser().read_text(encoding="utf-8").strip()
+        except OSError:
+            raise ValueError("GPT-Live api_key_file is unreadable; no credential fallback") from None
+        if not api_key:
+            raise ValueError("GPT-Live api_key_file is empty; no credential fallback")
+    else:
+        from tools.tool_backend_helpers import resolve_openai_audio_api_key
+        api_key = str(live.get("api_key") or "").strip() or resolve_openai_audio_api_key()
     return api_key, base_url
 
 
@@ -134,11 +153,18 @@ def resolve_gpt_live_status() -> Dict[str, Any]:
     voice = _voice_section()
     mode = voice_chat_mode(voice)
     live = _live_section(voice)
-    api_key, _base = _resolve_credentials(live)
+    provider = str(live.get("provider") or "openai").strip().lower()
+    try:
+        api_key, _base = _resolve_credentials(live)
+        reason = None if api_key else "no GPT-Live API key"
+    except ValueError as exc:
+        api_key = ""
+        reason = str(exc)
     return {
         "mode": mode,
+        "provider": provider,
         "available": bool(api_key),
-        "reason": None if api_key else "no OpenAI API key (set OPENAI_API_KEY or voice.gpt_live.api_key)",
+        "reason": reason,
         "model": str(live.get("model") or DEFAULT_LIVE_MODEL),
         "voice": str(live.get("voice") or DEFAULT_LIVE_VOICE),
     }
@@ -174,12 +200,21 @@ def create_webrtc_session(sdp_offer: str, history: Optional[list] = None) -> Dic
         "session": build_session_config(history),
         "transport": {"type": "webrtc", "sdp": sdp_offer},
     }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if str(live.get("provider") or "openai").strip().lower() == "azure":
+        headers["api-key"] = api_key
+    else:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
-        f"{base_url}/live/sessions", data=body, method="POST",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+        f"{base_url}/live/sessions", data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            result = json.loads(resp.read().decode("utf-8"))
+        logger.info("GPT-Live session minted provider=%s endpoint=%s model=%s session_id=%s",
+                    str(live.get("provider") or "openai"), base_url,
+                    str(live.get("model") or DEFAULT_LIVE_MODEL),
+                    (result.get("session") or {}).get("id"))
+        return result
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:600]
         logger.warning("GPT-Live session creation failed: %s %s", exc.code, detail)

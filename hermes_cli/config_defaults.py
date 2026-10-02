@@ -1197,6 +1197,9 @@ DEFAULT_CONFIG = {
         #              selected); needs an OpenAI API key. $0.05/min voice layer billing.
         "voice_chat_mode": "chained",
         "gpt_live": {
+            "provider": "openai",  # openai | azure; Azure never uses OpenAI credentials
+            "api_key_file": "",  # server-local key path; no fallback when a path is selected
+            "base_url": "",  # Azure requires https://RESOURCE.openai.azure.com/openai/v1
             "model": "gpt-live-1",
             "voice": "marin",  # marin | quartz | ripple | vesper | willow | stone | gleam | meridian | ...
             # Extra sentences appended to the live model's conversation persona (tone, pacing, language).

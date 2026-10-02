@@ -218,6 +218,21 @@ Requirements: an OpenAI API key (`OPENAI_API_KEY`, `VOICE_TOOLS_OPENAI_KEY`, or 
 
 How it works: pressing the voice button opens a WebRTC session from the desktop to GPT-Live; the desktop only ever receives a session id and an SDP answer — the key stays on the gateway host, which performs the session creation (`POST /api/audio/voice-live/session`). Each `session.delegation.created` becomes a normal turn on the open chat (the bubble shows what you said; the recent spoken exchange rides the model input as a per-turn note, never the system prompt, so the reply is speakable prose). Tool activity is fed to the voice as quiet context ("Hermes is working: terminal") so it can tell you what is happening if you ask; the final answer is streamed back sentence by sentence. Saying the stop phrase ends the conversation. If `gpt-live` is selected but no key resolves, the button falls back to the chained mode with a notice.
 
+For Azure-hosted GPT-Live, select the provider explicitly and keep the key in a server-local file:
+
+```yaml
+voice:
+  voice_chat_mode: gpt-live
+  gpt_live:
+    provider: azure
+    base_url: https://RESOURCE.openai.azure.com/openai/v1
+    model: YOUR_DEPLOYMENT_NAME
+    api_key_file: /absolute/server/path/azure-live.key
+    voice: marin
+```
+
+The file contains only the existing resource API key; keep it out of source control and restrict its permissions. Azure uses the `api-key` header. Missing, empty or unreadable files, invalid Azure endpoints and failed config reads refuse the mint; they do not resolve an OpenAI credential or retry on OpenAI. This affects only the Live frontend, not the main reasoning model or chained STT/TTS settings. Azure usage is billed to the selected resource's subscription. See [Azure GPT-Live WebRTC](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/gpt-live-webrtc).
+
 Not supported in this mode: the Nous-managed audio proxy (direct key only), the CLI/TUI (`/voice` keeps the chained loop), and the `tts` tool (it keeps using `tts.provider`).
 
 ### Barge-in
