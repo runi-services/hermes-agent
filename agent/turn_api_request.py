@@ -97,6 +97,10 @@ def build_api_request(
 ) -> ApiRequestBuild:
     """Assemble the attempt's request in the original order (every mutation happens BEFORE
     middleware/hooks/debug dumps observe the payload)."""
+    from gateway.delegated_authority import current_grant, agent_context_missing, DelegatedDenied
+    if agent_context_missing(agent):
+        raise DelegatedDenied()
+    current_grant()
     from agent.conversation_loop import (
         _moa_client_consumes_prepared_request, _redecorate_prompt_cache_for_provider,
     )

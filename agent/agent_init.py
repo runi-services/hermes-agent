@@ -2220,6 +2220,12 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    from gateway.delegated_authority import current_grant
+    if current_grant() is not None:
+        skip_memory = skip_context_files = skip_background_review = True
+        # Keep the explicitly selected profile's static identity, not shared memory.
+        enabled_toolsets = []
+        disabled_toolsets = []
     _params = locals()
     for _name in _PASSTHROUGH_PARAMS:
         setattr(agent, _name, _params[_name])

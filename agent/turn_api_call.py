@@ -65,6 +65,10 @@ def perform_api_call(
     interrupted: Any,
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
+    from gateway.delegated_authority import current_grant, agent_context_missing, DelegatedDenied
+    if agent_context_missing(agent):
+        raise DelegatedDenied()
+    current_grant()
     response = None
 
     def _verdict(action: str) -> ApiCallVerdict:

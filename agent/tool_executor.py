@@ -433,7 +433,8 @@ def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _Parse
     name = _canonical_tool_name(tool_call.function.name)
     args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
     scope_block = None
-    if parse_error is None:
+    from gateway.delegated_authority import protected_execution, agent_context_missing
+    if parse_error is None and not protected_execution() and not agent_context_missing(agent):
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
 
@@ -704,6 +705,18 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    from gateway.delegated_authority import dispatch_protected, protected_execution, agent_context_missing
+    if agent_context_missing(agent):
+        if begin_execution is not None:
+            begin_execution()
+        return _ManagedToolResult(result=json.dumps({"error": "Delegated context missing"}),
+            args=function_args, middleware_trace=[], blocked=True, dispatched=False)
+    if protected_execution():
+        if begin_execution is not None:
+            begin_execution()
+        result = dispatch_protected(function_name, function_args)
+        return _ManagedToolResult(result=result, args=function_args, middleware_trace=[],
+                                  blocked='"error"' in result, dispatched=True)
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -1500,6 +1513,11 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     """Pick the execute callable for one sequential call and start its spinner. Precedence:
     inline agent-level tools, delegate_task, context-engine tools, memory-provider tools,
     then the registry."""
+    from gateway.delegated_authority import protected_execution, dispatch_protected, agent_context_missing
+    if agent_context_missing(agent):
+        return _SequentialDispatch(lambda args: json.dumps({"error": "Delegated context missing"}))
+    if protected_execution():
+        return _SequentialDispatch(lambda args: dispatch_protected(ref.name, args))
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )

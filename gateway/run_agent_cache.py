@@ -462,6 +462,8 @@ class GatewayAgentCacheMixin:
         invalidation_reason: str, release_running_state: bool = True,
     ) -> None:
         """Interrupt the current run and clear queued session state consistently."""
+        from gateway.delegated_authority import invalidate_session
+        invalidate_session(session_key)
         if not session_key:
             return
         state = self._peek_session_state(session_key)

@@ -1654,6 +1654,10 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
     replace."""
     existing = pending_messages.get(session_key)
+    from gateway.delegated_authority import refuse_aggregate
+    if refuse_aggregate(existing, event):
+        pending_messages.pop(session_key, None)
+        return
     if existing:
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO
@@ -3448,6 +3452,9 @@ class BasePlatformAdapter(ABC):
 
     async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
         """Buffer normal queue-mode busy text and schedule a bounded flush."""
+        from gateway.delegated_authority import refuse_aggregate
+        if refuse_aggregate(event):
+            return
         store = self._text_debounce_store()
         state = store.get(session_key)
         if state is not None and not self._can_merge_text_debounce_events(state.event, event):
