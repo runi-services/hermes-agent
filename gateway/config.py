@@ -767,7 +767,7 @@ def load_gateway_config() -> GatewayConfig:
         # A declared safety policy cannot disappear into the legacy/default path
         # merely because the YAML failed to load. Unreadable files are ambiguous.
         try:
-            yaml_text = (_home / "config.yaml").read_text()
+            yaml_text = (_home / "config.yaml").read_text(encoding="utf-8")
         except Exception:
             raise ValueError("Unable to read gateway safety configuration") from None
         if "delegated_routing" in gw_data or "delegated_routing" in yaml_text:
