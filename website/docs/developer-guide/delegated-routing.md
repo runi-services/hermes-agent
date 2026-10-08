@@ -116,7 +116,14 @@ Reviewed aliases remain exact throughout sequential and concurrent agent-loop
 dispatch; legacy aliases are not rewritten in protected turns. Protected success,
 error and cancellation results bypass ordinary lifecycle pre/post hooks, progress
 and completion callbacks, guardrail observers and file-verifier observers. The
-normal per-person transcript remains available to the agent.
+normal per-person transcript remains available to the agent. Protected remote
+payloads exceeding 50,000 serialized characters are rejected in full before
+credential scanning or model/transcript publication, with a fixed narrow-read
+error rather than partial data or general recovery-tool hints. Per-result and
+model-scaled aggregate limits are applied in memory before incremental transcript
+flush; aggregate finalization never enters general spill storage or steering
+observers, even after the bound receipt is invalidated or lost. This is an output
+publication bound, not an HTTP-response ingestion or remote-data-size guarantee.
 
 The native final sender retains the bound occurrence throughout its awaits. Reply
 work registers for cancellation on revocation or shutdown and has the grant's

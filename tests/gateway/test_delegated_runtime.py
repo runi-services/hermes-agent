@@ -45,13 +45,13 @@ def executor_agent(monkeypatch):
     return create
 
 
-def _loop_calls(agent, mode, names):
+def _loop_calls(agent, mode, names, *, finalize=False):
     from agent.tool_executor import execute_tool_calls_sequential, execute_tool_calls_concurrent
     calls = [SimpleNamespace(id=f"call-{i}", function=SimpleNamespace(name=name, arguments="{}"))
              for i, name in enumerate(names)]
     messages = []
     execute = execute_tool_calls_sequential if mode == "sequential" else execute_tool_calls_concurrent
-    execute(agent, SimpleNamespace(tool_calls=calls), messages, "fixture", finalize=False)
+    execute(agent, SimpleNamespace(tool_calls=calls), messages, "fixture", finalize=finalize)
     return messages
 
 
@@ -1134,3 +1134,115 @@ def test_vault_shutdown_clears_credentials_even_after_receipt_mutation():
     authority.close()
     assert grant.bearer == "", "shutdown must clear the stored credential despite an altered event receipt"
     assert not authority._grants
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["sequential", "concurrent", "inline", "registry", "direct"])
+async def test_protected_oversized_read_never_spills_or_offers_host_recovery(runtime, executor_agent, monkeypatch, mode):
+    from tools import tool_result_storage
+    from tools.registry import registry
+    from model_tools import handle_function_call
+    r = runtime
+    r.mcp.result = "private oversized fixture " + "x " * 100_014
+    writes, results = [], []
+    # Intercept the actual writer so a RED cannot write any workload fixture to disk.
+    def writer(*args):
+        writes.append(args)
+        return "/synthetic/spillover.txt"
+    monkeypatch.setattr(tool_result_storage, "_write_to_spillover", writer)
+    monkeypatch.setattr(tool_result_storage, "_write_to_sandbox", writer)
+    def probe(event):
+        agent = executor_agent()
+        if mode in {"sequential", "concurrent"}:
+            results.extend(_loop_calls(agent, mode, ["read_fixture"], finalize=True))
+        elif mode == "inline":
+            results.append(agent._invoke_tool("read_fixture", {}, "fixture"))
+        elif mode == "registry":
+            results.append(registry.dispatch("read_fixture", {}))
+        else:
+            results.append(handle_function_call("read_fixture", {}))
+        return "fixture final"
+    r.probe = probe
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    await r.drain()
+    assert results
+    assert not writes, "protected workload reached the ordinary host spill writer"
+    rendered = json.dumps(results)
+    assert "<persisted-output>" not in rendered
+    assert "Use the read_file tool" not in rendered
+    assert "process it with execute_code" not in rendered
+    assert len(rendered) < 50_000, "oversized read must be bounded before model/transcript publication"
+    assert "exceeded" in rendered.lower()
+
+
+@pytest.mark.parametrize("context_state", ["active", "invalidated", "missing"])
+def test_protected_aggregate_finalization_is_bounded_without_general_storage(monkeypatch, context_state):
+    import time
+    from gateway.delegated_authority import DelegatedAuthority, bind_agent
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    from agent.tool_executor import _finalize_tool_batch
+    from tools.budget_config import BudgetConfig
+    from tools import tool_result_storage
+    authority = DelegatedAuthority()
+    event = MessageEvent(text="fixture", source=SessionSource(Platform("teams"), "fixture", user_id="fixture"))
+    authority.issue(event, SimpleNamespace(), "synthetic-resource", time.time() + 60)
+    agent = SimpleNamespace()
+    writes, steers = [], []
+    agent._apply_pending_steer_to_tool_results = lambda *args: steers.append(args)
+    monkeypatch.setattr(tool_result_storage, "_write_to_spillover", lambda *args: writes.append(args) or "/synthetic/spill.txt")
+    messages = [{"role": "tool", "tool_call_id": str(i), "content": "private aggregate " + "x" * 40_000} for i in range(6)]
+    with authority.bind(event):
+        bind_agent(agent)
+        if context_state == "invalidated":
+            authority.invalidate(event)
+        if context_state != "missing":
+            _finalize_tool_batch(agent, messages, "fixture", len(messages), BudgetConfig(turn_budget=100_000))
+    if context_state == "missing":
+        _finalize_tool_batch(agent, messages, "fixture", len(messages), BudgetConfig(turn_budget=100_000))
+    assert not writes, "aggregate protected finalization reached host storage"
+    assert not steers
+    assert sum(len(m["content"]) for m in messages) <= 100_000
+    assert all("<persisted-output>" not in m["content"] and "Use the read_file tool" not in m["content"] for m in messages)
+    authority.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["sequential", "concurrent"])
+async def test_protected_real_batch_is_bounded_before_transcript_flush(runtime, executor_agent, monkeypatch, mode):
+    from agent import tool_executor
+    from tools import tool_result_storage
+    r = runtime
+    r.mcp.result = "private batch " + "x " * 10_000
+    flushed, writes, results = [], [], []
+    # Observe the actual persistence seam without writing a private test transcript.
+    def flush(agent, messages, **kwargs):
+        flushed.append(sum(len(m.get("content", "")) for m in messages if m.get("role") == "tool"))
+        return True
+    monkeypatch.setattr(tool_executor, "_flush_session_db_after_tool_progress", flush)
+    monkeypatch.setattr(tool_result_storage, "_write_to_spillover", lambda *args: writes.append(args) or "/synthetic/spill.txt")
+    def probe(event):
+        agent = executor_agent()
+        agent.context_compressor.context_length = 62_500
+        results.extend(_loop_calls(agent, mode, ["read_fixture"] * 6, finalize=True))
+        return "fixture final"
+    r.probe = probe
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    await r.drain()
+    assert len(results) == 6
+    assert flushed and max(flushed) <= 100_000
+    assert not writes
+    assert any("exceeded" in m["content"] for m in results)
+    assert "synthetic/spill" not in json.dumps(results)
+
+
+def test_private_credential_scan_is_linear_for_a_long_non_jwt_and_still_denies_assertion():
+    import hashlib
+    from tools.delegated_mcp import _safe_result
+    assertion = "synthetic.header.signature"
+    grant = SimpleNamespace(bearer="synthetic-resource", assertion_digest=hashlib.sha256(assertion.encode()).hexdigest())
+    _safe_result("x" * 49_000, grant)
+    with pytest.raises(DelegatedDenied):
+        _safe_result("private " + assertion + " value", grant)

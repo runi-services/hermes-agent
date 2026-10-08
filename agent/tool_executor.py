@@ -1010,6 +1010,12 @@ def _commit_tool_result(
         # Retain the ordinary transcript contract, without publishing workload data
         # to general callbacks, guardrail observers, file verifiers or spill/hint paths.
         content = agent._tool_result_content_for_active_model(function_name, function_result)
+        used = sum(len(m.get("content", "")) for m in messages
+                   if m.get("role") == "tool" and isinstance(m.get("content"), str))
+        remaining = max(0, budget.turn_budget - used)
+        if not isinstance(content, str) or len(content) > min(budget.default_result_size, remaining):
+            refusal = '{"error":"Protected output exceeded the inline budget; narrow the read selectors."}'
+            content = refusal if len(refusal) <= remaining else ""
         messages.append(make_tool_result_message(function_name, content, tool_call_id,
                                                 effect_disposition=effect_disposition))
         if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
@@ -1079,6 +1085,19 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     """Per-turn aggregate budget enforcement, then /steer injection — in that order, so the
     steer marker is never truncated/discarded when enforcement replaces a result."""
     if num_tools <= 0:
+        return
+    if _protected_observers(agent):
+        # Budget private output in memory only, including an invalidated/missing
+        # receipt on a protected agent. Do not enter spill storage or steer hooks.
+        batch = messages[-num_tools:]
+        remaining = max(0, budget.turn_budget)
+        refusal = '{"error":"Protected aggregate output exceeded the inline budget; narrow the read selectors."}'
+        for message in batch:
+            content = message.get("content", "")
+            if not isinstance(content, str) or len(content) > remaining:
+                content = refusal if len(refusal) <= remaining else ""
+                message["content"] = content
+            remaining -= len(content)
         return
     enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)

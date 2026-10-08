@@ -36,7 +36,19 @@ def _http_client(headers):
 
 _CREDENTIAL_FIELDS = frozenset({"token", "accesstoken", "refreshtoken", "idtoken", "authorization",
     "assertion", "bearer", "password", "secret", "clientsecret", "apikey", "headers"})
-_JWT = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+_JWT = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])")
+_MAX_READ_OUTPUT_CHARS = 50_000
+
+
+def _safe_payload(result, grant):
+    payload = result.model_dump(mode="json", exclude_none=True)
+    encoded = json.dumps(payload)
+    if len(encoded) > _MAX_READ_OUTPUT_CHARS:
+        # Reject the whole payload before credential scanning or model/transcript
+        # publication. Never spill private data or advertise general recovery tools.
+        return json.dumps({"error": "Protected read output exceeded the inline limit; narrow the read selectors."})
+    _safe_result(payload, grant)
+    return encoded
 
 
 def _safe_result(value, grant):
@@ -75,7 +87,7 @@ async def call_read_tool(name, args):
             current, reviewed = authorize_tool(name, args)
             if remote_name != reviewed.remote_name:
                 raise DelegatedDenied()
-            _safe_result(result.model_dump(mode="json", exclude_none=True), current)
+            _safe_payload(result, current)
 
     sent = set()
 
@@ -117,9 +129,7 @@ async def call_read_tool(name, args):
                     authorize_tool(name, args)
                     result = await session.call_tool(binding.remote_name, arguments=args)
                     current, _ = authorize_tool(name, args)
-                    payload = result.model_dump(mode="json", exclude_none=True)
-                    _safe_result(payload, current)
-                    return json.dumps(payload)
+                    return _safe_payload(result, current)
     finally:
         client.headers.pop("Authorization", None)
         grant = None
