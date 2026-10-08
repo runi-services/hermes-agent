@@ -267,6 +267,8 @@ class _ToolCallRef:
         """Emit the one terminal ``post_tool_call`` for this call (``outcome`` = status /
         error_type / error_message / duration_ms). Resolved through the module attribute so
         tests patching ``_emit_terminal_post_tool_call`` still intercept."""
+        if _protected_observers(agent):
+            return
         _emit_terminal_post_tool_call(
             agent,
             function_name=self.name,
@@ -430,7 +432,9 @@ class _ParsedCall:
 
 
 def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
-    name = _canonical_tool_name(tool_call.function.name)
+    name = tool_call.function.name
+    if not _protected_observers(agent):
+        name = _canonical_tool_name(name)
     args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
     scope_block = None
     from gateway.delegated_authority import protected_execution, agent_context_missing
@@ -921,6 +925,8 @@ def _safe_callback(callback, label: str, *args, **kwargs) -> None:
 
 def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -> None:
     """Run user-visible and checkpoint preflight on final tool arguments."""
+    if _protected_observers(agent):
+        return
     function_name, function_args, effective_task_id, tool_call_id = ref.name, ref.args, ref.task_id, ref.call_id
     display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
     if _tool_progress_enabled(agent):
@@ -959,6 +965,8 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
 
 def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata, blocked: bool) -> None:
     """Fire ``tool_complete_callback`` (unless blocked) then the ``tool.output_risk`` projection."""
+    if _protected_observers(agent):
+        return
     if not blocked and agent.tool_complete_callback:
         try:
             display_args = _redact_tool_args_for_display(ref.name, ref.args) or ref.args
@@ -998,6 +1006,15 @@ def _commit_tool_result(
     pre-persist content for UI previews) or ``None`` when the flush failed (stop the batch).
     """
     function_name, function_args, tool_call_id, effective_task_id = ref.name, ref.args, ref.call_id, ref.task_id
+    if _protected_observers(agent):
+        # Retain the ordinary transcript contract, without publishing workload data
+        # to general callbacks, guardrail observers, file verifiers or spill/hint paths.
+        content = agent._tool_result_content_for_active_model(function_name, function_result)
+        messages.append(make_tool_result_message(function_name, content, tool_call_id,
+                                                effect_disposition=effect_disposition))
+        if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
+            return None
+        return function_result, function_result, None
     if observed:
         if not blocked:
             function_result = agent._append_guardrail_observation(
@@ -1067,8 +1084,13 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
+def _protected_observers(agent) -> bool:
+    from gateway.delegated_authority import protected_execution, agent_context_missing
+    return protected_execution() or agent_context_missing(agent)
+
+
 def _tool_progress_enabled(agent) -> bool:
-    return not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off"
+    return not _protected_observers(agent) and not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off"
 
 
 def _preview(text: str, limit: int) -> str:
@@ -1404,7 +1426,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             return False
         _persisted, display_function_result, risk_metadata = committed
 
-        if agent._should_emit_quiet_tool_messages():
+        if not _protected_observers(agent) and agent._should_emit_quiet_tool_messages():
             cute_msg = _get_cute_tool_message_impl(ref.name, ref.args, tool_duration, result=display_function_result)
             agent._safe_print(f"  {cute_msg}")
         elif _tool_progress_enabled(agent):

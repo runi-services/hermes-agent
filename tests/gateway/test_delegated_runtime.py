@@ -31,6 +31,31 @@ SERVICE = "https://smba.trafficmanager.net/teams/"
 
 
 @pytest.fixture
+def executor_agent(monkeypatch):
+    from agent import model_metadata
+    from run_agent import AIAgent
+    monkeypatch.setattr(model_metadata, "fetch_model_metadata", lambda **kw: {
+        "fixture-model": {"context_length": 128000, "max_completion_tokens": 4096}})
+    def create():
+        from gateway.delegated_authority import bind_agent
+        agent = AIAgent(model="fixture-model", provider="openrouter", api_key="synthetic",
+                        base_url="https://fixture.invalid/v1", quiet_mode=True, skip_context_files=True)
+        bind_agent(agent)
+        return agent
+    return create
+
+
+def _loop_calls(agent, mode, names):
+    from agent.tool_executor import execute_tool_calls_sequential, execute_tool_calls_concurrent
+    calls = [SimpleNamespace(id=f"call-{i}", function=SimpleNamespace(name=name, arguments="{}"))
+             for i, name in enumerate(names)]
+    messages = []
+    execute = execute_tool_calls_sequential if mode == "sequential" else execute_tool_calls_concurrent
+    execute(agent, SimpleNamespace(tool_calls=calls), messages, "fixture", finalize=False)
+    return messages
+
+
+@pytest.fixture
 def anyio_backend():
     return "asyncio"
 
@@ -102,6 +127,8 @@ async def runtime(monkeypatch, tmp_path):
     def refuse_network(*args, **kwargs):
         raise AssertionError("native fixture attempted network access")
     monkeypatch.setattr(socket, "getaddrinfo", refuse_network)
+    monkeypatch.setattr(socket.socket, "connect", refuse_network)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse_network)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir()
@@ -179,7 +206,8 @@ async def runtime(monkeypatch, tmp_path):
         "client_secret": "synthetic-secret", "tenant_id": row["tenant_id"]}))
     adapter._app = app
     runner = object.__new__(GatewayRunner)
-    runner.config = GatewayConfig.from_dict({"multiplex_profiles": True, "delegated_routing": cfg})
+    runner.config = GatewayConfig.from_dict({"multiplex_profiles": True, "delegated_routing": cfg,
+        "platforms": {"teams": {"enabled": True}}})
     runner.adapters = {Platform("teams"): adapter}
     adapter.gateway_runner = runner
     ingress = TeamsDelegatedIngress(adapter, runner.config.delegated_routing)
@@ -685,7 +713,7 @@ async def test_native_occurrence_traverses_normal_turn_runner_and_real_agent_set
         if executor:
             executor.shutdown(wait=True)
         if runner._session_db:
-            runner._session_db.close()
+            await runner._session_db.close()
 
 
 @pytest.mark.anyio
@@ -806,3 +834,303 @@ async def test_valid_cached_user_assertion_completes_a_fresh_bound_challenge(run
     await r.drain()
     assert len(r.exchanges) == 1 and len(r.received) == 1
     assert "synthetic read result" in r.answers[0]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["sequential", "concurrent", "inline", "registry", "direct"])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+async def test_protected_executor_never_publishes_to_ordinary_observers(runtime, executor_agent, mode, outcome):
+    from hermes_cli.plugins import PluginContext, get_plugin_manager
+    from hermes_cli.plugins_manifest import PluginManifest
+    from hermes_cli.lifecycle import invoke_hook
+    from gateway.delegated_authority import invalidate_events
+    from tools.registry import registry
+    from model_tools import handle_function_call
+    r = runtime
+    observations, results = [], []
+    if outcome == "error":
+        r.mcp.failure = "loss"
+    def probe(event):
+        agent = executor_agent()
+        ctx = PluginContext(PluginManifest(name="fixture-observer"), get_plugin_manager())
+        handles = [ctx.register_hook(name, lambda **kw: observations.append(kw))
+                   for name in ("pre_tool_call", "post_tool_call", "transform_tool_result")]
+        agent.tool_complete_callback = lambda *args, **kw: observations.append((args, kw))
+        agent.tool_progress_callback = lambda *args, **kw: observations.append((args, kw))
+        agent.tool_start_callback = lambda *args, **kw: observations.append((args, kw))
+        def guardrail_observer(name, args, result, **kw):
+            observations.append((name, args, result))
+            return result
+        agent._append_guardrail_observation = guardrail_observer
+        agent._record_file_mutation_result = lambda *args: observations.append(args)
+        try:
+            # Control: registrations use the real lifecycle dispatcher.
+            invoke_hook("post_tool_call", tool_name="fixture-control", result="control")
+            assert observations
+            observations.clear()
+            if outcome == "cancel":
+                invalidate_events(event)
+                agent._interrupt_requested = True
+            if mode in {"sequential", "concurrent"}:
+                result = _loop_calls(agent, mode, ["read_fixture", "read_fixture"])
+            elif mode == "inline":
+                result = agent._invoke_tool("read_fixture", {}, "fixture")
+            elif mode == "registry":
+                result = registry.dispatch("read_fixture", {})
+            else:
+                result = handle_function_call("read_fixture", {})
+            results.append(result)
+            return "fixture answer"
+        finally:
+            for handle in handles:
+                handle.dispose()
+    r.probe = probe
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    await r.drain()
+    assert results, "real executor must complete the exercised path"
+    if outcome == "success":
+        assert "synthetic read result" in str(results)
+    assert observations == [], "protected tool data reached an ordinary observer"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["sequential", "concurrent"])
+@pytest.mark.parametrize("alias", ["process", "cronjob"])
+async def test_reviewed_alias_reaches_only_exact_remote_binding(runtime, executor_agent, mode, alias):
+    from dataclasses import replace
+    r = runtime
+    route = r.ingress.policy.routes[0]
+    binding = replace(route.tools[0], name=alias, remote_name="reviewed_read")
+    r.runner.config.delegated_routing = r.ingress.policy = replace(r.ingress.policy,
+        routes=(replace(route, tools=(binding,)),))
+    results = []
+    def probe(event):
+        agent = executor_agent()
+        assert {t["function"]["name"] for t in agent.tools} == {alias}
+        results.extend(_loop_calls(agent, mode, [alias, alias + "_manage"]))
+        return "fixture answer"
+    r.probe = probe
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    await r.drain()
+    assert len(results) == 2
+    assert "synthetic read result" in str(results[0])
+    assert "denied" in str(results[1])
+    calls = [b["params"]["name"] for _, _, b in r.mcp.requests if b.get("method") == "tools/call"]
+    assert calls == ["reviewed_read"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("action", ["valid", "expiry", "interrupt", "reset", "supersede", "shutdown"])
+async def test_native_final_dispatch_rechecks_authority_after_sender_await(runtime, monkeypatch, action):
+    from gateway.delegated_authority import bind_agent, invalidate_agent
+    r = runtime
+    entered, release = asyncio.Event(), asyncio.Event()
+    native_client = r.adapter._app.activity_sender._client
+    prepare = native_client._prepare_headers
+    paused = False
+    observed_context = []
+    async def pause_headers(*args, **kwargs):
+        nonlocal paused
+        # The personal card has already been dispatched when this seam is installed.
+        if not paused:
+            paused = True
+            observed_context.append(current_grant())
+            entered.set()
+            await release.wait()
+        return await prepare(*args, **kwargs)
+    def probe(event):
+        agent = SimpleNamespace()
+        bind_agent(agent)
+        r.reply_agent = agent
+        monkeypatch.setattr(native_client, "_prepare_headers", pause_headers)
+        return "private fixture final"
+    r.probe = probe
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    task = next(iter(r.ingress.tasks.values()))
+    await asyncio.wait_for(entered.wait(), 5)
+    event = r.received[0]
+    if action == "expiry":
+        r.ingress.authority.check(event).expiry = 0
+    elif action == "interrupt":
+        invalidate_agent(r.reply_agent)
+    elif action == "reset":
+        from gateway.delegated_authority import invalidate_session
+        invalidate_session(build_session_key(event.source, profile=event.source.profile))
+    elif action == "supersede":
+        assert (await r.send(r.body(activity_id="next", text="next question")))["status"] == 200
+    elif action == "shutdown":
+        await r.ingress.close()
+    release.set()
+    await asyncio.gather(task, return_exceptions=True)
+    finals = [s for s in r.sends if s.get("text") == "private fixture final"]
+    assert len(finals) == (1 if action == "valid" else 0)
+    if action == "valid":
+        assert observed_context[0] is not None, "authority must remain bound throughout native sender awaits"
+        assert finals[0]["replyToId"] == "question"
+
+
+@pytest.mark.anyio
+async def test_native_reply_expiry_cancels_waiting_sender_without_release(runtime, monkeypatch):
+    import time
+    r = runtime
+    entered = asyncio.Event()
+    native_client = r.adapter._app.activity_sender._client
+    async def blocked_headers(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+    def probe(event):
+        current_grant().deadline = time.monotonic() + 0.05
+        monkeypatch.setattr(native_client, "_prepare_headers", blocked_headers)
+        return "private fixture final"
+    r.probe = probe
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    task = next(iter(r.ingress.tasks.values()))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done, "expiry must cancel a reply blocked before HTTP dispatch"
+        assert len(r.sends) == 1
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.anyio
+async def test_retired_partitions_do_not_permanently_exhaust_native_admission(runtime):
+    r = runtime
+    # No transport traffic: simulate historical partitions that were cancelled.
+    for i in range(4096):
+        r.ingress._invalidate(f"retired-{i}")
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    await r.drain()
+    assert len(r.received) == 1
+
+
+@pytest.mark.anyio
+async def test_active_capacity_recovers_on_expiry_without_reviving_reused_key(runtime, monkeypatch):
+    from plugins.platforms.teams import delegated
+    r = runtime
+    monkeypatch.setattr(delegated, "_MAX_ACTIVE_PARTITIONS", 1, raising=False)
+    assert (await r.send(r.body()))["status"] == 200
+    old = next(iter(r.ingress.pending.values()))
+    assert (await r.send(r.body(conversation="other", activity_id="other")))["status"] == 429
+    old.expires = 0
+    assert (await r.send(r.body(activity_id="replacement")))["status"] == 200
+    replacement = next(iter(r.ingress.pending.values()))
+    assert replacement.generation != old.generation
+    with pytest.raises(DelegatedDenied):
+        r.ingress._check_pending(old)
+    with pytest.raises(DelegatedDenied):
+        r.ingress._check_route(old)
+    assert (await r.send(r.exchange()))["status"] == 200
+    await r.drain()
+    assert (await r.send(r.body(conversation="other", activity_id="after-completion")))["status"] == 200
+    # Completed grants and native generations must not retain historical identities.
+    assert len(r.ingress.authority._generations) <= len(r.ingress.authority._grants)
+    assert len(r.ingress.generations) <= len(r.ingress.pending) + len(r.ingress.tasks)
+
+
+@pytest.mark.anyio
+async def test_expired_inflight_auth_releases_capacity_but_cannot_issue_late(runtime, monkeypatch):
+    from plugins.platforms.teams import delegated
+    r = runtime
+    monkeypatch.setattr(delegated, "_MAX_ACTIVE_PARTITIONS", 1, raising=False)
+    assert (await r.send(r.body()))["status"] == 200
+    old = next(iter(r.ingress.pending.values()))
+    r.exchange_wait = asyncio.Event()
+    exchange = asyncio.create_task(r.send(r.exchange()))
+    await asyncio.wait_for(r.exchange_started.wait(), 5)
+    try:
+        assert (await r.send(r.body(conversation="other", activity_id="busy")))["status"] == 429
+        old.expires = 0
+        assert (await r.send(r.body(conversation="other", activity_id="after-expiry")))["status"] == 200
+        r.exchange_wait.set()
+        assert (await exchange)["status"] == 403
+        assert not r.received
+    finally:
+        r.exchange_wait.set()
+        await exchange
+
+
+@pytest.mark.anyio
+async def test_native_secondary_receiving_bot_is_protected_before_dispatch(runtime, monkeypatch, tmp_path):
+    from dataclasses import replace
+    r = runtime
+    secondary = tmp_path / "home" / "profiles" / "secondary"
+    secondary.mkdir(parents=True)
+    (secondary / "config.yaml").write_text("platforms:\n  teams:\n    enabled: true\n")
+    route = replace(r.ingress.policy.routes[0], bot_profile="secondary")
+    r.runner.config.delegated_routing = r.ingress.policy = replace(r.ingress.policy, routes=(route,))
+    r.adapter.set_owner_profile("secondary")
+    with monkeypatch.context() as m:
+        import gateway.run as gateway_run
+        m.setattr(gateway_run, "_load_profile_secret_scope", lambda *args: pytest.fail("startup hydrated runtime secrets"))
+        r.ingress.install()
+    assert (await r.send(r.body(person="66666666-6666-4666-8666-666666666666")))["status"] == 403
+    assert not (r.created or r.received or r.observers)
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    await r.drain()
+    assert len(r.received) == 1
+    assert "synthetic read result" in r.answers[0]
+
+
+@pytest.mark.anyio
+async def test_native_dispatch_fence_denies_even_if_sender_suppresses_cancellation(runtime, monkeypatch):
+    from gateway.delegated_authority import invalidate_events
+    r = runtime
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    client = r.adapter._app.activity_sender._client
+    prepare = client._prepare_headers
+    async def pause(*args, **kwargs):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+        return await prepare(*args, **kwargs)
+    def probe(event):
+        monkeypatch.setattr(client, "_prepare_headers", pause)
+        return "private fixture final"
+    r.probe = probe
+    assert (await r.send(r.body()))["status"] == 200
+    assert (await r.send(r.exchange()))["status"] == 200
+    task = next(iter(r.ingress.tasks.values()))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.to_thread(invalidate_events, r.received[0])
+        await asyncio.wait_for(cancelled.wait(), 5)
+        await asyncio.gather(task, return_exceptions=True)
+        assert len(r.sends) == 1, "the native HTTP fence must refuse the revoked final request"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("alias, canonical", [("process", "process_manage"), ("cronjob", "cronjob_manage")])
+def test_legacy_agent_parser_keeps_alias_canonicalization(alias, canonical):
+    from agent.tool_executor import _parse_tool_call
+    call = SimpleNamespace(id="legacy", function=SimpleNamespace(name=alias, arguments="{}"))
+    parsed = _parse_tool_call(SimpleNamespace(), call)
+    assert parsed.name == canonical
+
+
+def test_vault_shutdown_clears_credentials_even_after_receipt_mutation():
+    import time
+    from gateway.delegated_authority import DelegatedAuthority
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionSource
+    authority = DelegatedAuthority()
+    event = MessageEvent(text="fixture", source=SessionSource(Platform("teams"), "fixture", user_id="fixture"))
+    authority.issue(event, SimpleNamespace(), "synthetic-resource", time.time() + 60)
+    grant = authority.check(event)
+    event._delegated_handle = None
+    authority.close()
+    assert grant.bearer == "", "shutdown must clear the stored credential despite an altered event receipt"
+    assert not authority._grants

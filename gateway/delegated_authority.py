@@ -6,7 +6,9 @@ ContextVar never copies or revives authority. Only authenticated adapters issue.
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields
+import asyncio
 import hashlib
+from itertools import count
 import json
 import threading
 import time
@@ -52,10 +54,12 @@ class _Grant:
     assertion_digest: str = ""
     validator: object = None
     run_validator: object = None
+    waiters: set = field(default_factory=set, repr=False)
 
 
 _current = ContextVar("delegated_executor", default=None)
 _authorities = weakref.WeakSet()
+_issuances = count(1)
 
 
 class DelegatedAuthority:
@@ -68,24 +72,32 @@ class DelegatedAuthority:
 
     def invalidate_partition(self, key):
         with self._lock:
-            self._generations[key] = self._generations.get(key, 0) + 1
+            self._generations.pop(key, None)
             for handle, grant in list(self._grants.items()):
                 if grant.key == key:
-                    grant.bearer = ""
-                    del self._grants[handle]
+                    self._revoke(handle)
 
     def invalidate(self, event):
         with self._lock:
-            grant = self._grants.pop(getattr(event, "_delegated_handle", None), None)
-            if grant is not None:
-                grant.bearer = ""
+            self._revoke(getattr(event, "_delegated_handle", None))
+
+    def _revoke(self, handle):
+        # Caller holds the vault lock. Stored handles remain authoritative even
+        # when an event's receipt was corrupted or replaced.
+        grant = self._grants.pop(handle, None)
+        if grant is not None:
+            grant.bearer = ""
+            if self._generations.get(grant.key) == grant.generation:
+                self._generations.pop(grant.key, None)
+            for loop, task in grant.waiters:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(task.cancel)
 
     def close(self):
         with self._lock:
             self._closed = True
-            for grant in self._grants.values():
-                grant.bearer = ""
-            self._grants.clear()
+            for handle in list(self._grants):
+                self._revoke(handle)
 
     def issue(self, event, route, bearer, expiry, *, assertion="", validator=None):
         if not isinstance(bearer, str) or not bearer or any(c.isspace() for c in bearer) or expiry <= time.time():
@@ -95,6 +107,7 @@ class DelegatedAuthority:
             if self._closed:
                 raise DelegatedDenied()
             self.invalidate_partition(key)
+            self._generations[key] = next(_issuances)
             handle = Handle()
             event._delegated_handle = handle
             event.source.delegated_session = True
@@ -129,6 +142,21 @@ class DelegatedAuthority:
             yield
         finally:
             _current.reset(token)
+
+    async def await_bound(self, event, action):
+        """Keep reply work bound, deadline-limited and cancellable by any revoker."""
+        with self.bind(event):
+            waiter = (asyncio.get_running_loop(), asyncio.current_task())
+            with self._lock:
+                grant = self.check(event)
+                grant.waiters.add(waiter)
+            try:
+                remaining = min(grant.expiry - time.time(), grant.deadline - time.monotonic())
+                async with asyncio.timeout(max(0, remaining)):
+                    return await action()
+            finally:
+                with self._lock:
+                    grant.waiters.discard(waiter)
 
 
 def current_grant():

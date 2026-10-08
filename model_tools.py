@@ -674,7 +674,8 @@ def _emit_post_tool_call_hook(
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
     fields are derived from the result only past that gate when status is None."""
-    if _post_tool_call_hook_suppressed.get():
+    from gateway.delegated_authority import protected_execution
+    if _post_tool_call_hook_suppressed.get() or protected_execution():
         return
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook

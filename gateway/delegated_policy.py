@@ -189,7 +189,22 @@ def validate_delegated_targets(config):
         return
     if not config.multiplex_profiles:
         raise ValueError("delegated_routing requires explicitly enabled multiplex_profiles")
-    from gateway.run import _multiplex_profile_homes
-    served = {name for name, _ in _multiplex_profile_homes(config)}
+    from gateway.run import _multiplex_profile_homes, _profile_runtime_scope
+    from gateway.config import Platform, load_gateway_config
+    from hermes_cli.profiles import get_active_profile_name
+    served = dict(_multiplex_profile_homes(config))
     if any(r.profile not in served for r in config.delegated_routing.routes):
         raise ValueError("delegated_routing target is not served")
+    active = get_active_profile_name() or "default"
+    for owner in {r.bot_profile for r in config.delegated_routing.routes}:
+        if owner is None:
+            receiving = config
+        else:
+            if owner in {"default", active} or owner not in served:
+                raise ValueError("delegated_routing receiving bot must name a served secondary or use null for primary")
+            # Inspect local configuration in its own scope, without external secret hydration.
+            with _profile_runtime_scope(served[owner], hydrate_secrets=False):
+                receiving = load_gateway_config()
+        teams = receiving.platforms.get(Platform("teams"))
+        if teams is None or not teams.enabled:
+            raise ValueError("delegated_routing receiving Teams bot is not enabled")

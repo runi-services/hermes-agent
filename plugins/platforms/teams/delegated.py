@@ -8,6 +8,7 @@ import asyncio
 import base64
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import count
 import json
 import time
 import weakref
@@ -16,6 +17,10 @@ from gateway.config import Platform
 from gateway.delegated_authority import DelegatedAuthority, DelegatedDenied, partition, _fingerprint
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource, build_session_key
+
+
+_MAX_ACTIVE_PARTITIONS = 256
+_issuances = count(1)
 
 
 @dataclass(repr=False)
@@ -39,8 +44,10 @@ class TeamsDelegatedIngress:
         self.authority = DelegatedAuthority()
         self.pending = {}
         self.generations = {}
+        self._occurrences = {}
         self.seen = {}
         self.tasks = {}
+        self._running_tasks = set()
         self._closed = False
         self.validators = {r.tenant_id: TokenValidator.for_entra(
             adapter._client_id, r.tenant_id, scope="access_as_user") for r in policy.routes}
@@ -53,7 +60,18 @@ class TeamsDelegatedIngress:
         server = self.adapter._app.server
         if server._skip_auth or server._token_validator is None:
             raise ValueError("Protected Teams ingress requires SDK service authentication")
+        self.adapter._app.activity_sender._client.use_interceptor(self)
         server.on_request = self.on_request
+
+    def request(self, context):
+        # SDK request interceptors execute after its awaited bot-token resolution,
+        # immediately before httpx hands the request to the transport. Once handed
+        # off, cancellation cannot establish whether the service received it.
+        from gateway.delegated_authority import protected_execution, current_grant
+        if protected_execution():
+            if self._closed:
+                raise DelegatedDenied()
+            self.authority.check(current_grant().event)
 
     def _identity(self, activity):
         body = activity.model_dump(by_alias=True, exclude_none=True)
@@ -89,19 +107,39 @@ class TeamsDelegatedIngress:
 
     def _check_pending(self, pending):
         key = partition(pending.event.source)
-        if (pending.expires <= time.monotonic() or self.generations.get(key) != pending.generation
+        if (self._closed or pending.expires <= time.monotonic() or self.generations.get(key) != pending.generation
                 or _fingerprint(pending.event) != pending.fingerprint
                 or self.adapter.gateway_runner.config.delegated_routing is not self.policy
                 or self.adapter.gateway_runner._profile_name_for_source(pending.event.source) != pending.route.profile):
             raise DelegatedDenied()
 
     def _invalidate(self, key):
-        self.generations[key] = self.generations.get(key, 0) + 1
+        self.generations.pop(key, None)
+        self._occurrences.pop(key, None)
         self.authority.invalidate_partition(key)
         self.pending.pop(key, None)
         task = self.tasks.pop(key, None)
         if task is not None:
             task.cancel()
+
+    def _retire(self, pending):
+        key = partition(pending.event.source)
+        if self.generations.get(key) == pending.generation:
+            self._invalidate(key)
+
+    def _finished(self, pending, task):
+        self._running_tasks.discard(task)
+        self._retire(pending)
+
+    def _reap(self, now):
+        for key, pending in list(self._occurrences.items()):
+            if key in self.tasks:
+                try:
+                    self.authority.check(pending.event)
+                except DelegatedDenied:
+                    self._invalidate(key)
+            elif pending.expires <= now:
+                self._invalidate(key)
 
     async def on_request(self, request):
         from microsoft_teams.api import InvokeResponse
@@ -112,9 +150,7 @@ class TeamsDelegatedIngress:
                 raise DelegatedDenied()
             body, tenant, sender = self._identity(request.body)
             now = time.monotonic()
-            for key, pending in list(self.pending.items()):
-                if pending.expires <= now:
-                    self._invalidate(key)
+            self._reap(now)
             self.seen = {k: expiry for k, expiry in self.seen.items() if expiry > now}
             if body["conversation"].get("conversationType") == "personal":
                 return await self._personal_exchange(body, tenant, sender)
@@ -126,7 +162,7 @@ class TeamsDelegatedIngress:
             occurrence = (key, body["id"])
             if occurrence in self.seen:
                 return InvokeResponse(status=200)
-            if key not in self.generations and len(self.generations) >= 4096:
+            if key not in self.generations and len(self.generations) >= _MAX_ACTIVE_PARTITIONS:
                 return InvokeResponse(status=429)
             self._invalidate(key)
             text = body.get("text", "")
@@ -138,14 +174,20 @@ class TeamsDelegatedIngress:
                 return InvokeResponse(status=200)
             if text.lstrip().startswith("/"):
                 raise DelegatedDenied()
-            if len(self.seen) >= 4096 or len(self.pending) >= 256:
+            if len(self.seen) >= 4096:
                 return InvokeResponse(status=429)
             self.seen[occurrence] = now + 600
             event = MessageEvent(text=text, source=source, message_id=body["id"], allow_gateway_control=False)
+            self.generations[key] = next(_issuances)
             pending = _Pending(event, route, ref, sender["id"], now + 180,
                                self.generations[key], _fingerprint(event))
+            self._occurrences[key] = pending
             self.pending[key] = pending
-            await self._sign_in(pending)
+            try:
+                await self._sign_in(pending)
+            except BaseException:
+                self._retire(pending)
+                raise
             return InvokeResponse(status=200)
         except asyncio.CancelledError:
             raise
@@ -208,11 +250,16 @@ class TeamsDelegatedIngress:
         self._check_pending(pending)
         # Consume before validation/exchange awaits, while keeping the independent generation fence.
         del self.pending[key]
-        await self._exchange(pending, value.get("token", ""))
-        self._check_pending(pending)
+        try:
+            await self._exchange(pending, value.get("token", ""))
+            self._check_pending(pending)
+        except BaseException:
+            self._retire(pending)
+            raise
         task = asyncio.create_task(self._run(pending))
         self.tasks[key] = task
-        task.add_done_callback(lambda done: self.tasks.pop(key, None) if self.tasks.get(key) is done else None)
+        self._running_tasks.add(task)
+        task.add_done_callback(lambda done: self._finished(pending, done))
         return InvokeResponse(status=200)
 
     async def _exchange(self, pending, assertion):
@@ -247,7 +294,7 @@ class TeamsDelegatedIngress:
 
     def _check_route(self, pending):
         # Pending's consent TTL is distinct from the issued token's lifetime.
-        if (self.generations.get(partition(pending.event.source)) != pending.generation
+        if (self._closed or self.generations.get(partition(pending.event.source)) != pending.generation
                 or self.adapter.gateway_runner.config.delegated_routing is not self.policy
                 or self.adapter.gateway_runner._profile_name_for_source(pending.event.source) != pending.route.profile):
             raise DelegatedDenied()
@@ -260,12 +307,12 @@ class TeamsDelegatedIngress:
                 return
             with self.authority.bind(event):
                 response = await self.adapter._message_handler(event)
-            self.authority.check(event)
-            if response:
-                from microsoft_teams.api import MessageActivityInput
-                await self.adapter._app.activity_sender.send(
-                    MessageActivityInput(text=str(response), reply_to_id=pending.reference.activity_id),
-                    pending.reference)
+                self.authority.check(event)
+                if response:
+                    from microsoft_teams.api import MessageActivityInput
+                    await self.authority.await_bound(event, lambda: self.adapter._app.activity_sender.send(
+                        MessageActivityInput(text=str(response), reply_to_id=pending.reference.activity_id),
+                        pending.reference))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -275,12 +322,13 @@ class TeamsDelegatedIngress:
 
     async def close(self):
         self._closed = True
+        tasks = list(self._running_tasks)
         for key in tuple(self.generations):
-            self.generations[key] += 1
+            self._invalidate(key)
         self.authority.close()
         self.pending.clear()
-        tasks = list(self.tasks.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self.tasks.clear()
+        self._running_tasks.clear()

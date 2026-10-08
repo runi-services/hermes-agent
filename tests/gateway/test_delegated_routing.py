@@ -75,6 +75,8 @@ def test_policy_roundtrip_served_targets_and_disabled_legacy(tmp_path, monkeypat
         GatewayRunner(config)
     # The real served-profile resolver observes an existing temp profile; the policy never enrolls it.
     (tmp_path / "profiles" / "fixture").mkdir(parents=True)
+    from gateway.config import PlatformConfig
+    config.platforms[Platform("teams")] = PlatformConfig(enabled=True)
     validate_delegated_targets(config)
     assert GatewayConfig.from_dict(config.to_dict()).delegated_routing == config.delegated_routing
     runner = object.__new__(GatewayRunner)
@@ -115,3 +117,41 @@ def test_declared_policy_cannot_disappear_on_yaml_syntax_failure(tmp_path, monke
     (tmp_path / "config.yaml").write_text("gateway:\n  delegated_routing: [\n")
     with pytest.raises(ValueError):
         load_gateway_config()
+
+
+@pytest.mark.parametrize("owner", ["default", "missing", "disabled", "unserved", None])
+def test_receiving_bot_must_be_enabled_and_served_before_runner_hydration(tmp_path, monkeypatch, owner):
+    from gateway.run import GatewayRunner
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    home = tmp_path / "home"
+    (home / "profiles" / "disabled").mkdir(parents=True)
+    (home / "profiles" / "disabled" / "config.yaml").write_text("platforms:\n  teams:\n    enabled: false\n")
+    (home / "profiles" / "unserved").mkdir()
+    (home / "profiles" / "unserved" / "config.yaml").write_text("platforms:\n  teams:\n    enabled: true\n")
+    (home / "profiles" / ".deleted").mkdir()
+    (home / "profiles" / ".deleted" / "unserved").touch()
+    raw = policy()
+    raw["routes"][0].update(profile="default", bot_profile=owner)
+    config = GatewayConfig.from_dict({"multiplex_profiles": True, "delegated_routing": raw,
+        "platforms": {"teams": {"enabled": owner is not None}}})
+    with pytest.raises(ValueError, match="receiving"):
+        GatewayRunner(config)
+
+
+@pytest.mark.parametrize("owner", [None, "secondary"])
+def test_receiving_bot_primary_and_served_secondary_are_valid(tmp_path, monkeypatch, owner):
+    from gateway.delegated_policy import validate_delegated_targets
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    home = tmp_path / "home"
+    (home / "profiles" / "secondary").mkdir(parents=True)
+    (home / "profiles" / "secondary" / "config.yaml").write_text("platforms:\n  teams:\n    enabled: true\n")
+    raw = policy()
+    raw["routes"][0].update(profile="default", bot_profile=owner)
+    config = GatewayConfig.from_dict({"multiplex_profiles": True, "delegated_routing": raw,
+        "platforms": {"teams": {"enabled": True}}})
+    validate_delegated_targets(config)
+    assert config.delegated_routing.protects(owner)

@@ -10,8 +10,12 @@ Absent configuration, or `enabled: false`, keeps legacy dispatch. When enabled,
 each receiving bot named by a route is **exclusive** to its configured routes.
 Unmatched people, tenants, channels, personal messages and unsupported activities
 on that bot are refused. Other receiving bots and platforms retain legacy routing.
-An omitted `bot_profile` selects the primary bot; a named value selects an existing
-secondary bot. Review this blast radius before activation.
+An omitted or null `bot_profile` selects the primary bot. The string `default`
+and the active profile's name are rejected as selectors; a named value must select
+an existing, served secondary profile with Teams enabled. The primary Teams adapter
+must also be enabled when selected. Startup validates receiving bots as well as
+destination profiles, before ingress or external secret hydration. Review this
+blast radius before activation.
 
 ## Configuration
 
@@ -89,6 +93,14 @@ question, stop, reset, session switch, cancellation, merge, debounce, steering o
 redirect cannot extend old authority. `/stop`, `/new` and `/reset` are host controls;
 other slash commands are refused in this lane. New questions need a new challenge.
 
+At most 256 partitions may be authenticating or executing at once. Completed,
+failed and expired occurrences release their entries; an in-flight exchange still
+counts until its deadline. Expired entries are reaped before admitting another
+request. Process-unique issuance generations prevent a late callback from reviving
+an occurrence after its partition is freed and reused. The bounded duplicate cache
+retains up to 4096 recent message IDs for ten minutes; a full cache denies new
+questions until entries expire, rather than forgetting replay protection.
+
 ## Executor boundary
 
 The normal gateway turn runner and agent are reused. Protected agent construction
@@ -99,6 +111,21 @@ schemas. Registry, agent-inline and model-tool entry points intercept protected
 calls before ordinary middleware, hooks and Tool Search. Terminal, file, browser,
 code execution, delegation and message-send handlers are unreachable. Global MCP
 tool/resource handlers also refuse protected contexts.
+
+Reviewed aliases remain exact throughout sequential and concurrent agent-loop
+dispatch; legacy aliases are not rewritten in protected turns. Protected success,
+error and cancellation results bypass ordinary lifecycle pre/post hooks, progress
+and completion callbacks, guardrail observers and file-verifier observers. The
+normal per-person transcript remains available to the agent.
+
+The native final sender retains the bound occurrence throughout its awaits. Reply
+work registers for cancellation on revocation or shutdown and has the grant's
+expiry deadline. A native SDK HTTP interceptor rechecks authority after awaited
+bot-token resolution, before transport handoff. This suppresses stale replies
+still waiting before dispatch, including a sender that catches cancellation.
+Once handed to the HTTP transport, delivery may already have occurred: cancellation
+cannot retract that request or distinguish delivery from a lost response. There
+is no automatic resend at this unknown-delivery boundary.
 
 Each allowed call opens its own maintained MCP `ClientSession` and streamable HTTP
 transport with only the bound person's bearer, then closes them and clears local
@@ -134,6 +161,8 @@ The build was exercised with Teams Apps 2.0.13.4 / API 2.0.15, MCP 2.0.0, httpx2
 falls back to a different installed transport. This repository's current MCP and
 Teams extras already pin the tested primary versions; no dependency installation
 or pin changes are part of this feature.
+The review corrections were also exercised against the release-locked Teams Apps,
+API and Common packages all at 2.0.13.4, with MCP 2.0.0 and httpx2 2.7.0.
 
 Synthetic signed-JWT tests exercise the real SDK HTTP route and personal API
 primitives, normal gateway/agent setup, worker context propagation and maintained
