@@ -217,10 +217,10 @@ def test_file_names_cannot_escape_or_overwrite_and_history_is_unchanged(tmp_path
     assert len(set(paths)) == len(names)
     for i, path in enumerate(paths):
         saved = Path(path)
-        assert saved.is_relative_to(tmp_path / "cache" / "scratch")
+        assert saved.parent == tmp_path / "cache" / "documents"
         assert saved.read_bytes() == str(i).encode()
         assert stat.S_IMODE(saved.stat().st_mode) == 0o600
-        assert stat.S_IMODE(saved.parent.stat().st_mode) == 0o700
+
         assert str(saved) in text
     assert types == ["application/octet-stream"] * len(names)
     _, later, _ = fileparts.materialize(message, home=str(tmp_path))
@@ -301,6 +301,57 @@ def test_routed_profile_file_lives_in_receiver_home(tmp_path, monkeypatch):
     assert paths[0].read_bytes() == b"hello"
     assert str(paths[0]) in seen[0]
     assert not list((tmp_path / "gateway-profile").rglob("a2a-file-*"))
+
+
+def test_document_cache_is_flat_prunable_and_sandbox_translatable(
+    tmp_path, monkeypatch
+):
+    import os
+    import time
+    from gateway.platforms.base import cleanup_document_cache, get_document_cache_dir
+    from plugins.platforms.a2a import fileparts
+    from tools.credential_files import to_agent_visible_cache_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _, paths, _ = fileparts.materialize({"parts": [{"raw": "aGVsbG8="}]})
+    saved = Path(paths[0])
+    assert saved.parent == get_document_cache_dir()
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    assert (
+        to_agent_visible_cache_path(str(saved))
+        == f"/root/.hermes/cache/documents/{saved.name}"
+    )
+    old = time.time() - 25 * 3600
+    os.utime(saved, (old, old))
+    assert cleanup_document_cache() == 1
+    assert not saved.exists()
+
+
+@pytest.mark.parametrize("failure", ["not-ready", "dispatch"])
+def test_post_write_failed_dispatch_removes_received_files(
+    tmp_path, monkeypatch, failure
+):
+    from unittest.mock import Mock
+    from plugins.platforms.a2a import adapter as adapter_module
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    instance = A2AAdapter(PlatformConfig(enabled=True))
+    if failure == "dispatch":
+        instance._loop = Mock(spec=asyncio.AbstractEventLoop)
+        instance._message_handler = Mock()
+
+        def refuse(coroutine, loop):
+            coroutine.close()
+            raise RuntimeError("fixture dispatch refusal")
+
+        monkeypatch.setattr(adapter_module.asyncio, "run_coroutine_threadsafe", refuse)
+    terminal, pending = instance._prepare_task(
+        _body({"raw": "aGVsbG8="})["params"], "fixture-peer"
+    )
+    assert pending is None
+    assert terminal is not None
+    assert terminal["status"]["state"] == protocol.STATE_FAILED
+    assert not list(tmp_path.rglob("a2a-*")), "failed dispatch leaks file bytes"
 
 
 def test_text_and_uri_reads_never_materialize_or_fetch(tmp_path, monkeypatch):

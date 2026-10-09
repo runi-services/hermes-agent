@@ -78,16 +78,18 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   filename for files, JSON for data) so the agent sees them; it also
   accepts v0.3 (kind) and pre-0.3 (type) shapes from older peers.
   Inline v1 `raw` and legacy `file.bytes` are materialized at receiver
-  admission into the owning profile's `cache/scratch/a2a-file-*` directory,
-  with private files and index-prefixed safe names. Local gateway events
+  admission into the owning profile's native document cache as flat
+  `a2a-file-<uuid>-<index>-<safe-name>` files at mode 0600. Local gateway events
   carry the paths and media types; routed CLI profiles receive those paths
   in their framed text. Original parts remain available in task history.
   Malformed/oversized inline files or write failures reject the entire task,
   never dispatching a text-only substitute. Bounds: 16 files and 1 MiB
   decoded aggregate, in addition to the unchanged 1 MiB HTTP body ceiling.
   `extract_text` remains read-only; URL parts remain references (no fetch).
-  Files are scratch, not durable archives; retention follows the owning
-  profile's scratch maintenance, not a new attachment janitor.
+  Files use the existing document-cache mounts/path translation and hourly
+  housekeeping's 24-hour age prune, not a new retention daemon. Admission
+  write failures and immediate FAILED dispatch paths remove their own files.
+  Base64 must be unwrapped/strict; MIME-style line breaks are rejected.
   Outbound replies are still text-only — the agent produces text, and
   file/data Parts are for inbound richness.
 - Push notification config: full CRUD — create (inline in message/send

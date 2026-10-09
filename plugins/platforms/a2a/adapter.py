@@ -808,6 +808,8 @@ class A2AAdapter(BasePlatformAdapter):
                 except Exception as e:
                     reply = security.redact_outbound(f"Profile dispatch failed: {e}")
                     state = protocol.STATE_FAILED
+                if state == protocol.STATE_FAILED:
+                    fileparts.remove(media_urls)
                 if not fut.done():
                     fut.set_result((state, reply))
 
@@ -820,6 +822,7 @@ class A2AAdapter(BasePlatformAdapter):
             return None, pending
 
         if self._loop is None or self._message_handler is None:
+            fileparts.remove(media_urls)
             self.tasks.complete(task_id, protocol.STATE_FAILED, "")
             protocol.metrics.tasks_failed += 1
             return protocol.build_task(
@@ -849,6 +852,7 @@ class A2AAdapter(BasePlatformAdapter):
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception as e:
             self._pop_pending(task_id)
+            fileparts.remove(media_urls)
             msg = security.redact_outbound(f"Dispatch failed: {e}")
             self.tasks.complete(task_id, protocol.STATE_FAILED, msg)
             protocol.metrics.tasks_failed += 1
