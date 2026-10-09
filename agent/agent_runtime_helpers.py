@@ -2233,6 +2233,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     """Invoke a single tool (agent-level or registry-dispatched) and return the result string;
     no display logic. Used by the concurrent path; the sequential path keeps its own inline
     invocation for display."""
+    from gateway.delegated_authority import dispatch_protected, agent_context_missing
+    if agent_context_missing(agent):
+        return json.dumps({"error": "Delegated context missing"})
+    protected_result = dispatch_protected(function_name, function_args)
+    if protected_result is not None:
+        return protected_result
     from agent.inline_tool_executors import (
         InlineToolContext, emit_terminal_post_tool_call, resolve_invoke_tool_executor, tool_hook_ids
     )

@@ -321,6 +321,12 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + "..." if len(text) > limit else text
 
 
+def _stable_channel_id(activity) -> Optional[str]:
+    data = getattr(activity, "channel_data", None)
+    channel = data.get("channel") if isinstance(data, dict) else getattr(data, "channel", None)
+    return channel.get("id") if isinstance(channel, dict) else getattr(channel, "id", None)
+
+
 def _approval_body(cmd: str, desc: str, *, always: bool = False) -> list:
     """Adaptive Card body blocks for an approval prompt; unless ``always``, empty ``cmd``/``desc`` omit their blocks."""
     body = []
@@ -396,6 +402,11 @@ class TeamsAdapter(BasePlatformAdapter):
 
             self._wire_plugin_handlers(self._app)
             await self._app.initialize()
+            policy = getattr(getattr(getattr(self, "gateway_runner", None), "config", None), "delegated_routing", None)
+            if policy is not None and policy.protects(getattr(self, "_owner_profile", None)):
+                from plugins.platforms.teams.delegated import TeamsDelegatedIngress
+                self._delegated_ingress = TeamsDelegatedIngress(self, policy)
+                self._delegated_ingress.install()
             # Shared-listener mode (multiplex secondary): no bind; served at /p/<profile>/api/messages.
             from gateway.platforms.shared_ingress import bind_listener
             self._runner = await bind_listener(self, aiohttp_app, self._host, self._port, _WEBHOOK_PATH)
@@ -412,6 +423,8 @@ class TeamsAdapter(BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
+        if getattr(self, "_delegated_ingress", None) is not None:
+            await self._delegated_ingress.close()
         self._running = False
         if self._runner:
             await self._runner.cleanup()
@@ -463,6 +476,9 @@ class TeamsAdapter(BasePlatformAdapter):
                 return await _read_httpx_body_with_limit(response, media_type="attachment")
 
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
+        # Protected traffic enters through the authenticated pre-observer wrapper only.
+        if getattr(self, "_delegated_ingress", None) is not None:
+            return
         activity = ctx.activity
         bot_id = self._app.id if self._app else None
         if bot_id and getattr(activity.from_, "id", None) == bot_id:
@@ -486,7 +502,8 @@ class TeamsAdapter(BasePlatformAdapter):
             user_id=str(user_id),
             user_name=getattr(from_account, "name", None) or "",
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
-            message_id=msg_id)
+            message_id=msg_id,
+            parent_chat_id=_stable_channel_id(activity))
         media: list = [m for m in [await self._cache_attachment(a) for a in getattr(activity, "attachments", None) or []] if m]
         media_kinds = [kind for _, _, kind in media]  # media items are (path, media_type, kind)
         msg_type = next((t for kind, t in _MEDIA_KIND_PRECEDENCE if kind in media_kinds), MessageType.TEXT)

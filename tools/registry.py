@@ -827,6 +827,10 @@ class ToolRegistry:
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
         results normalized, every exception returned as ``{"error": ...}``."""
+        from gateway.delegated_authority import dispatch_protected
+        protected_result = dispatch_protected(name, args)
+        if protected_result is not None:
+            return protected_result
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")

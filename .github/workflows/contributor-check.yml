@@ -24,8 +24,9 @@ jobs:
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # Attribute only candidate commits against the PR's declared base.
+          # Release-based PRs must not inherit unrelated origin/main divergence.
+          MERGE_BASE=$(git merge-base "${{ github.event.pull_request.base.sha || 'origin/main' }}" HEAD)
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)

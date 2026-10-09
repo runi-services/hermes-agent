@@ -267,6 +267,8 @@ class _ToolCallRef:
         """Emit the one terminal ``post_tool_call`` for this call (``outcome`` = status /
         error_type / error_message / duration_ms). Resolved through the module attribute so
         tests patching ``_emit_terminal_post_tool_call`` still intercept."""
+        if _protected_observers(agent):
+            return
         _emit_terminal_post_tool_call(
             agent,
             function_name=self.name,
@@ -430,10 +432,13 @@ class _ParsedCall:
 
 
 def _parse_tool_call(agent, tool_call, *, flatten_probe: bool = False) -> _ParsedCall:
-    name = _canonical_tool_name(tool_call.function.name)
+    name = tool_call.function.name
+    if not _protected_observers(agent):
+        name = _canonical_tool_name(name)
     args, parse_error = _parse_tool_arguments(tool_call.function.arguments)
     scope_block = None
-    if parse_error is None:
+    from gateway.delegated_authority import protected_execution, agent_context_missing
+    if parse_error is None and not protected_execution() and not agent_context_missing(agent):
         name, args, scope_block = _unwrap_tool_search_call(agent, name, args, flatten_probe=flatten_probe)
     return _ParsedCall(tool_call, name, args, [], parse_error, scope_block)
 
@@ -704,6 +709,18 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    from gateway.delegated_authority import dispatch_protected, protected_execution, agent_context_missing
+    if agent_context_missing(agent):
+        if begin_execution is not None:
+            begin_execution()
+        return _ManagedToolResult(result=json.dumps({"error": "Delegated context missing"}),
+            args=function_args, middleware_trace=[], blocked=True, dispatched=False)
+    if protected_execution():
+        if begin_execution is not None:
+            begin_execution()
+        result = dispatch_protected(function_name, function_args)
+        return _ManagedToolResult(result=result, args=function_args, middleware_trace=[],
+                                  blocked='"error"' in result, dispatched=True)
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -908,6 +925,8 @@ def _safe_callback(callback, label: str, *args, **kwargs) -> None:
 
 def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -> None:
     """Run user-visible and checkpoint preflight on final tool arguments."""
+    if _protected_observers(agent):
+        return
     function_name, function_args, effective_task_id, tool_call_id = ref.name, ref.args, ref.task_id, ref.call_id
     display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
     if _tool_progress_enabled(agent):
@@ -946,6 +965,8 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
 
 def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata, blocked: bool) -> None:
     """Fire ``tool_complete_callback`` (unless blocked) then the ``tool.output_risk`` projection."""
+    if _protected_observers(agent):
+        return
     if not blocked and agent.tool_complete_callback:
         try:
             display_args = _redact_tool_args_for_display(ref.name, ref.args) or ref.args
@@ -985,6 +1006,21 @@ def _commit_tool_result(
     pre-persist content for UI previews) or ``None`` when the flush failed (stop the batch).
     """
     function_name, function_args, tool_call_id, effective_task_id = ref.name, ref.args, ref.call_id, ref.task_id
+    if _protected_observers(agent):
+        # Retain the ordinary transcript contract, without publishing workload data
+        # to general callbacks, guardrail observers, file verifiers or spill/hint paths.
+        content = agent._tool_result_content_for_active_model(function_name, function_result)
+        used = sum(len(m.get("content", "")) for m in messages
+                   if m.get("role") == "tool" and isinstance(m.get("content"), str))
+        remaining = max(0, budget.turn_budget - used)
+        if not isinstance(content, str) or len(content) > min(budget.default_result_size, remaining):
+            refusal = '{"error":"Protected output exceeded the inline budget; narrow the read selectors."}'
+            content = refusal if len(refusal) <= remaining else ""
+        messages.append(make_tool_result_message(function_name, content, tool_call_id,
+                                                effect_disposition=effect_disposition))
+        if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
+            return None
+        return function_result, function_result, None
     if observed:
         if not blocked:
             function_result = agent._append_guardrail_observation(
@@ -1050,12 +1086,30 @@ def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tool
     steer marker is never truncated/discarded when enforcement replaces a result."""
     if num_tools <= 0:
         return
+    if _protected_observers(agent):
+        # Budget private output in memory only, including an invalidated/missing
+        # receipt on a protected agent. Do not enter spill storage or steer hooks.
+        batch = messages[-num_tools:]
+        remaining = max(0, budget.turn_budget)
+        refusal = '{"error":"Protected aggregate output exceeded the inline budget; narrow the read selectors."}'
+        for message in batch:
+            content = message.get("content", "")
+            if not isinstance(content, str) or len(content) > remaining:
+                content = refusal if len(refusal) <= remaining else ""
+                message["content"] = content
+            remaining -= len(content)
+        return
     enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 
+def _protected_observers(agent) -> bool:
+    from gateway.delegated_authority import protected_execution, agent_context_missing
+    return protected_execution() or agent_context_missing(agent)
+
+
 def _tool_progress_enabled(agent) -> bool:
-    return not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off"
+    return not _protected_observers(agent) and not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off"
 
 
 def _preview(text: str, limit: int) -> str:
@@ -1391,7 +1445,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             return False
         _persisted, display_function_result, risk_metadata = committed
 
-        if agent._should_emit_quiet_tool_messages():
+        if not _protected_observers(agent) and agent._should_emit_quiet_tool_messages():
             cute_msg = _get_cute_tool_message_impl(ref.name, ref.args, tool_duration, result=display_function_result)
             agent._safe_print(f"  {cute_msg}")
         elif _tool_progress_enabled(agent):
@@ -1500,6 +1554,11 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     """Pick the execute callable for one sequential call and start its spinner. Precedence:
     inline agent-level tools, delegate_task, context-engine tools, memory-provider tools,
     then the registry."""
+    from gateway.delegated_authority import protected_execution, dispatch_protected, agent_context_missing
+    if agent_context_missing(agent):
+        return _SequentialDispatch(lambda args: json.dumps({"error": "Delegated context missing"}))
+    if protected_execution():
+        return _SequentialDispatch(lambda args: dispatch_protected(ref.name, args))
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )

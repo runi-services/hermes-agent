@@ -118,6 +118,16 @@ class GatewayInboundMixin:
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
         _config = getattr(self, "config", None)
+        from gateway.delegated_policy import policy_for_source
+        if policy_for_source(self, source) is not None:
+            from gateway.delegated_authority import current_grant, DelegatedDenied
+            try:
+                grant = current_grant()
+                if grant is None or grant.event is not event:
+                    return None
+                return event, source, False
+            except DelegatedDenied:
+                return None
 
         # 🔴 Cross-session leak guard: this per-message task was create_task()'d with a copy of the
         # spawning context, which may carry ANOTHER message's HERMES_SESSION_* ContextVars; until
@@ -613,6 +623,9 @@ class GatewayInboundMixin:
     ) -> Optional[str]:
         """Fast-path while this session's agent is running: interrupt by default (minimal latency);
         busy_input_mode queue/steer, subagent and compression protection demote to queue."""
+        from gateway.delegated_authority import refuse_aggregate
+        if refuse_aggregate(event):
+            return None
         from gateway.run import _AGENT_PENDING_SENTINEL
         _handled, _result = await self._hm_busy_slash_or_photo(event, source, _quick_key)
         if _handled:
@@ -1188,6 +1201,33 @@ class GatewayInboundMixin:
             return event, source, is_internal
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        from gateway.delegated_authority import DelegatedDenied, invalidate_events
+        from gateway.delegated_policy import policy_for_source
+        policy = policy_for_source(self, event.source)
+        if policy is not None:
+            try:
+                adapter = self._adapter_for_source(event.source)
+                ingress = getattr(adapter, "_delegated_ingress", None)
+                if ingress is None or ingress.policy is not policy:
+                    return None
+                if self._profile_name_for_source(event.source) != event.source.profile:
+                    return None
+                with ingress.authority.bind(event):
+                    response = await self._handle_admitted_message(event)
+                    ingress.authority.check(event)
+                    return response
+            except asyncio.CancelledError:
+                invalidate_events(event)
+                raise
+            except Exception:
+                invalidate_events(event)
+                return None
+        if getattr(event, "_delegated_handle", None) is not None:
+            invalidate_events(event)
+            return None
+        return await self._handle_admitted_message(event)
+
+    async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL

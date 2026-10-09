@@ -1308,6 +1308,9 @@ class GatewayAdapterLifecycleMixin:
         profile_home = self._profile_home_or_none(profile_name)
 
         async def _handler(event):
+            from gateway.delegated_authority import admit_before_hydration
+            if not admit_before_hydration(self, event):
+                return None
             self._stamp_event_profile(event, profile_name)
             async with self._scope_or_null(_async_profile_runtime_scope, profile_home):
                 return await self._handle_message(event)
@@ -1321,6 +1324,9 @@ class GatewayAdapterLifecycleMixin:
         profile_home = self._profile_home_or_none(profile_name)
 
         async def _handler(event, _session_key):
+            from gateway.delegated_authority import admit_before_hydration
+            if not admit_before_hydration(self, event):
+                return True
             self._stamp_event_profile(event, profile_name)
             async with self._scope_or_null(_async_profile_runtime_scope, profile_home):
                 return await self._handle_active_session_busy_message(event, self._session_key_for_source(event.source))
@@ -1335,6 +1341,9 @@ class GatewayAdapterLifecycleMixin:
 
         async def _handler(event):
             # A rejected route still enters ``_handle_message``, whose ingress gate drops it fail-closed.
+            from gateway.delegated_authority import admit_before_hydration
+            if not admit_before_hydration(self, event):
+                return None
             profile_home = self._admit_primary_source(event.source, default_home) or default_home
             async with _async_profile_runtime_scope(profile_home):
                 return await self._handle_message(event)
@@ -1350,6 +1359,9 @@ class GatewayAdapterLifecycleMixin:
 
         async def _handler(event, _session_key):
             source = event.source
+            from gateway.delegated_authority import admit_before_hydration
+            if not admit_before_hydration(self, event):
+                return True
             profile_home = self._admit_primary_source(source, default_home)
             if profile_home is None:
                 return True  # rejected route: swallow, same disposition as the ingress gate

@@ -218,6 +218,10 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
     """
+    from gateway.delegated_authority import current_grant
+    grant = current_grant()
+    if grant is not None:
+        return [tool.schema() for tool in grant.route.tools]
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                          skip_tool_search_assembly=skip_tool_search_assembly)
@@ -670,7 +674,8 @@ def _emit_post_tool_call_hook(
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
     fields are derived from the result only past that gate when status is None."""
-    if _post_tool_call_hook_suppressed.get():
+    from gateway.delegated_authority import protected_execution
+    if _post_tool_call_hook_suppressed.get() or protected_execution():
         return
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
@@ -871,6 +876,10 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
+    from gateway.delegated_authority import dispatch_protected
+    protected_result = dispatch_protected(function_name, function_args)
+    if protected_result is not None:
+        return protected_result
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}

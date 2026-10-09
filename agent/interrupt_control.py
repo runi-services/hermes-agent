@@ -101,6 +101,8 @@ class InterruptControlMixin:
         generation claim — published only if the turn's generation still matches at the final mutation edge;
         returns False if the turn resumed meanwhile.
         """
+        from gateway.delegated_authority import invalidate_agent
+        invalidate_agent(self)
         if require_generation is not None:
             # RESERVE the claim under the SAME lock `_touch_activity` stamps with; real progress invalidates
             # it and it is CONSUMED at the final mutation edge, so a resumed turn abandons the abort.
@@ -217,6 +219,9 @@ class InterruptControlMixin:
     def steer(self, text: str) -> bool:
         """Queue user text for delivery as its own user row after the current tool batch finishes (no
         interrupt); multiple calls concatenate with newlines. Returns False for empty text."""
+        from gateway.delegated_authority import invalidate_agent
+        if invalidate_agent(self):
+            return False
         if not text or not text.strip():
             return False
         cleaned = text.strip()
@@ -230,6 +235,9 @@ class InterruptControlMixin:
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
         to ``steer()``; Codex app-server uses native ``turn/steer``. False when no live turn / empty text."""
+        from gateway.delegated_authority import invalidate_agent
+        if invalidate_agent(self):
+            return False
         if not text or not text.strip():
             return False
         cleaned = text.strip()

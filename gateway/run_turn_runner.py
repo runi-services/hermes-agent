@@ -1068,6 +1068,8 @@ class TurnRunner:
         from gateway.run import _checkpoint_agent_kwargs
         ctx = self._ctx
         runner = self._runner
+        from gateway.delegated_authority import require_source_grant
+        require_source_grant(ctx.source)
         src = ctx.source
         return ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
@@ -1761,6 +1763,8 @@ class TurnRunner:
         """
         from gateway.run import _current_max_iterations, _normalize_empty_agent_response, _sanitize_gateway_final_response
         ctx = self._ctx
+        from gateway.delegated_authority import require_source_grant
+        require_source_grant(ctx.source)
         runner = self._runner
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
         # session_key is propagated via contextvars in _set_session_env() (_SESSION_KEY) and via
@@ -1796,6 +1800,8 @@ class TurnRunner:
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        from gateway.delegated_authority import bind_agent
+        bind_agent(agent)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)
         result = self._run_conversation_with_approval(agent, agent_history, observed_group_context, persist_msg, persist_ts)

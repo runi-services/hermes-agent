@@ -86,6 +86,7 @@ class SessionSource:
     profile: Optional[str] = None
     # Transport-local fail-closed signal: explicit profile route whose target is not served.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    delegated_session: bool = field(default=False, repr=False, compare=False)
     # Discord auto-thread metadata: explicit so pre-existing/renamed threads are never renamed.
     auto_thread_created: bool = False
     auto_thread_initial_name: Optional[str] = None
@@ -617,6 +618,8 @@ def is_shared_multi_user_session(
 ) -> bool:
     """True when a non-DM session is shared across participants (mirrors the
     isolation rules in :func:`build_session_key`)."""
+    if getattr(source, "delegated_session", False) is True:
+        return False
     if source.chat_type == "dm":
         return False
     return not (thread_sessions_per_user if source.thread_id else group_sessions_per_user)
@@ -663,6 +666,9 @@ def build_session_key(
     session per platform. Groups add the participant id only when ``group_sessions_per_user`` and
     not in a thread (threads are shared unless ``thread_sessions_per_user``).
     """
+    if getattr(source, "delegated_session", False) is True:
+        from gateway.delegated_authority import partition
+        return f"{_session_key_namespace(profile or source.profile)}:{source.platform.value}:delegated:{partition(source)}"
     is_dm = source.chat_type == "dm"
     chat_id = source.chat_id
     if is_dm and source.platform == Platform.WHATSAPP:
@@ -1087,6 +1093,8 @@ class SessionStore(
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
+        from gateway.delegated_authority import invalidate_session
+        invalidate_session(session_key)
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:
@@ -1127,6 +1135,8 @@ class SessionStore(
     def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
         reopens the target so resume matches the CLI."""
+        from gateway.delegated_authority import invalidate_session
+        invalidate_session(session_key)
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:

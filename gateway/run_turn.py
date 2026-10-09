@@ -1971,6 +1971,9 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        from gateway.delegated_authority import bind_run_generation, require_source_grant
+        require_source_grant(source)
+        bind_run_generation(lambda: self._is_session_run_current(_quick_key, run_generation))
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(

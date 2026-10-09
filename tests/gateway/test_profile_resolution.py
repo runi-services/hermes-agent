@@ -24,6 +24,9 @@ def mock_runner():
     runner._resolve_profile_home_for_source = GatewayRunner._resolve_profile_home_for_source.__get__(runner)
     # _handle_message's ingress gates (profile route rejection) live in this helper.
     runner._hm_admit_event = GatewayRunner._hm_admit_event.__get__(runner)
+    # _handle_message now wraps the native admission pipeline; a spec mock
+    # otherwise replaces that pipeline with an AsyncMock and bypasses its gates.
+    runner._handle_admitted_message = GatewayRunner._handle_admitted_message.__get__(runner)
     return runner
 
 

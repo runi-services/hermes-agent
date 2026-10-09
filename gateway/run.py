@@ -3352,6 +3352,8 @@ class GatewayRunner(
         # .env resolve as secondary profiles' do; explicit config= injection (tests) is left untouched.
         # See #64674.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        from gateway.delegated_policy import validate_delegated_targets
+        validate_delegated_targets(self.config)
         # Multiplexer flag flips agent.secret_scope.get_secret() to fail-closed on unscoped credential
         # reads, so a missed migration crashes loudly instead of leaking a cross-profile value.
         try:
@@ -4251,6 +4253,10 @@ class GatewayRunner(
         ``adapter_profile`` is the profile owning the receiving bot; only routes declaring it as
         ``bot_profile`` apply (#104933)."""
         config = getattr(self, "config", None)
+        from gateway.delegated_policy import resolve_delegated_profile
+        protected_profile = resolve_delegated_profile(self, source, adapter_profile)
+        if protected_profile is not None:
+            return protected_profile
         if not getattr(config, "multiplex_profiles", False):
             return None
         routes = getattr(config, "profile_routes", None)
