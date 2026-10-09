@@ -1,7 +1,7 @@
 name: a2a-platform
 label: A2A
 kind: platform
-version: 1.0.0
+version: 1.0.1
 description: >
   A2A (Agent-to-Agent) protocol v1.0 support for Hermes Agent — both directions
   of the open Linux Foundation standard for inter-agent communication.

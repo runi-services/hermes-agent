@@ -77,6 +77,17 @@ Peers resolved from `config.yaml` → `a2a_agents`, or a direct URL.
   extract_text renders file/data Parts into the text stream (URL +
   filename for files, JSON for data) so the agent sees them; it also
   accepts v0.3 (kind) and pre-0.3 (type) shapes from older peers.
+  Inline v1 `raw` and legacy `file.bytes` are materialized at receiver
+  admission into the owning profile's `cache/scratch/a2a-file-*` directory,
+  with private files and index-prefixed safe names. Local gateway events
+  carry the paths and media types; routed CLI profiles receive those paths
+  in their framed text. Original parts remain available in task history.
+  Malformed/oversized inline files or write failures reject the entire task,
+  never dispatching a text-only substitute. Bounds: 16 files and 1 MiB
+  decoded aggregate, in addition to the unchanged 1 MiB HTTP body ceiling.
+  `extract_text` remains read-only; URL parts remain references (no fetch).
+  Files are scratch, not durable archives; retention follows the owning
+  profile's scratch maintenance, not a new attachment janitor.
   Outbound replies are still text-only — the agent produces text, and
   file/data Parts are for inbound richness.
 - Push notification config: full CRUD — create (inline in message/send

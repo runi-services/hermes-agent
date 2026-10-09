@@ -56,7 +56,7 @@ from gateway.platforms.base import (
 )
 from gateway.config import Platform
 
-from . import protocol, security
+from . import fileparts, protocol, security
 
 logger = logging.getLogger(__name__)
 
@@ -733,7 +733,6 @@ class A2AAdapter(BasePlatformAdapter):
         the future the caller must wait on. Runs on an HTTP worker thread.
         """
         agent = agent or self._agents[""]
-        text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
 
@@ -750,6 +749,24 @@ class A2AAdapter(BasePlatformAdapter):
                 f"Anti-loop protection: context {context_id} exceeded "
                 f"{protocol.max_pingpong_turns()} turns. Start a new context or "
                 f"increase A2A_MAX_PINGPONG_TURNS.",
+                created_at=rec["created_iso"],
+            ), None
+
+        # HTTP authentication, peer trust and rate admission have already passed.
+        # Decode only here (not in extract_text, which also serves reads/polls).
+        try:
+            inbox_home = None
+            if not agent.get("local", True):
+                inbox_home = _profile_home(str(agent.get("profile") or agent.get("slug") or ""))
+                if not inbox_home:
+                    raise fileparts.FilePartError("Profile inbox unavailable")
+            text, media_urls, media_types = fileparts.materialize(params, home=inbox_home)
+        except fileparts.FilePartError as exc:
+            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+            reason = str(exc)
+            self.tasks.complete(task_id, protocol.STATE_REJECTED, reason)
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_REJECTED, reason,
                 created_at=rec["created_iso"],
             ), None
 
@@ -815,7 +832,9 @@ class A2AAdapter(BasePlatformAdapter):
 
         event = MessageEvent(
             text=framed,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.DOCUMENT if media_urls else MessageType.TEXT,
+            media_urls=media_urls,
+            media_types=media_types,
             source=self.build_source(
                 chat_id=context_id,
                 chat_name=f"a2a:{peer}",
