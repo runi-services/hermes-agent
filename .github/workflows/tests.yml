@@ -73,9 +73,11 @@ jobs:
         # tests/conftest.py), so the SDKs those tests need must be in the
         # venv up front — resolved from uv.lock like everything else, which
         # also honors the exact supply-chain pins these extras carry.
+        # Native protected-ingress tests require the pinned Teams SDK as well;
+        # collect and execute them rather than skipping the optional dependency.
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra teams --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
 
       - name: Minimize uv cache
         # Optimized for CI: prunes pre-built wheels that are cheap to
