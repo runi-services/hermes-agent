@@ -887,6 +887,19 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             return []
         return list(ALL_TOOL_SCHEMAS)
 
+    def resolve_profile_target(self, peer: str) -> Optional[str]:
+        """Concrete Honcho peer id honcho_profile reads for *peer* (None if no session).
+
+        Same resolution as ``get_peer_card``; used by the API server to label
+        peer-card UI apps with the peer the card was actually read for.
+        """
+        if not self._manager or not self._session_key:
+            return None
+        session = self._manager._cache.get(self._session_key)
+        if not session:
+            return None
+        return self._manager._resolve_peer_id(session, peer)
+
     def _empty_profile_hint(self, peer: str) -> Dict[str, Any]:
         """Diagnostic hint for an empty honcho_profile card, so the model can explain WHY
         instead of surfacing a cryptic "no facts" to the user. Likely causes, in order:

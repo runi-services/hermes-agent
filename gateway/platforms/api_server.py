@@ -617,6 +617,113 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     agent._gateway_turn_process_epoch = None
 
 
+_HONCHO_PEER_CARD_URI = "ui://hugin/peer-card"
+_HONCHO_PEER_CARD_MIME = "text/html;profile=mcp-app"
+
+
+def _honcho_profile_apps_enabled() -> bool:
+    """Opt-in: only when the operator sets HONCHO_PROFILE_RESOURCE_URI to the peer-card URI."""
+    return os.getenv("HONCHO_PROFILE_RESOURCE_URI") == _HONCHO_PEER_CARD_URI
+
+
+def _valid_peer_id(value: Any) -> bool:
+    """Same rule the Hugin seat server applies to an app ``target``."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 128
+        and value.replace("-", "").replace("_", "").isalnum()
+    )
+
+
+def _honcho_profile_apps(messages: Any, targets: Any) -> List[Dict[str, str]]:
+    """Peer-card app descriptors for this turn's successful honcho_profile READS.
+
+    *messages* is the turn's slice of ``result["messages"]``; *targets* maps the
+    ``peer`` argument of a call to the concrete Honcho peer id (resolved by the
+    Honcho provider while the agent was alive). The target is taken only from
+    the tool call's arguments, never from message text. Writes (``card`` given),
+    errors, empty cards and every other tool yield nothing. Call order is kept.
+    """
+    if not isinstance(messages, list) or not isinstance(targets, dict):
+        return []
+    outputs: Dict[str, Any] = {}
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "tool" and msg.get("tool_call_id"):
+            outputs[msg["tool_call_id"]] = msg.get("content")
+    apps: List[Dict[str, str]] = []
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            func = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(func, dict) or func.get("name") != "honcho_profile":
+                continue
+            try:
+                args = json.loads(func.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(args, dict) or args.get("card"):
+                continue  # card update, not a read
+            peer = args.get("peer", "user")
+            if peer is None:
+                peer = "user"
+            target = targets.get(peer) if isinstance(peer, str) else None
+            if not _valid_peer_id(target):
+                continue
+            try:
+                out = json.loads(outputs.get(tc.get("id")) or "")
+            except (TypeError, ValueError):
+                continue
+            card = out.get("result") if isinstance(out, dict) else None
+            if (
+                not isinstance(out, dict)
+                or out.get("error")
+                or "hint" in out
+                or not isinstance(card, list)
+                or not card
+            ):
+                continue  # error or empty card
+            apps.append({
+                "resourceUri": _HONCHO_PEER_CARD_URI,
+                "mimeType": _HONCHO_PEER_CARD_MIME,
+                "tool": "honcho_profile",
+                "target": target,
+            })
+    return apps
+
+
+def _honcho_profile_targets(agent: Any, result: Any) -> Dict[str, str]:
+    """Resolve each ``peer`` argument used by this turn's honcho_profile calls.
+
+    Uses the Honcho provider's own alias resolution, so ``user``/``ai`` map to
+    the session's real peer ids exactly as ``get_peer_card`` does.
+    """
+    targets: Dict[str, str] = {}
+    try:
+        providers = list(agent._memory_manager.providers)
+        resolver = next(
+            p.resolve_profile_target for p in providers if hasattr(p, "resolve_profile_target")
+        )
+    except Exception:
+        return targets
+    for msg in (result.get("messages") or []) if isinstance(result, dict) else []:
+        for tc in (msg.get("tool_calls") or []) if isinstance(msg, dict) else []:
+            func = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(func, dict) or func.get("name") != "honcho_profile":
+                continue
+            try:
+                args = json.loads(func.get("arguments") or "{}")
+                peer = args.get("peer", "user")
+                peer = "user" if peer is None else peer
+                if isinstance(peer, str) and peer not in targets:
+                    resolved = resolver(peer)
+                    if isinstance(resolved, str):
+                        targets[peer] = resolved
+            except Exception:
+                continue
+    return targets
+
+
 def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
     """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
     user_message = body.get("message") or body.get("input")
@@ -3114,6 +3221,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return ""
         return "confirmed" if runtime else "accepted"
 
+    @classmethod
+    def _honcho_turn_apps(
+        cls, conversation_history: List[Dict[str, Any]], user_message: Any, result: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        """Peer-card apps for this turn only; none if the turn start is unknown.
+
+        A turn-start index of 0 means the transcript no longer starts with the history (e.g.
+        compression rewrote it). Never fall back to the whole transcript: that would replay
+        earlier turns' cards.
+        """
+        start = cls._response_messages_turn_start_index(conversation_history, user_message, result)
+        if not start:
+            return []
+        return _honcho_profile_apps(
+            (result.get("messages") or [])[start:], result.get("honcho_profile_targets"))
+
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
@@ -3129,12 +3252,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         final_response = _resolve_media_to_data_urls(
             result.get("final_response", "") if is_dict else "")
         headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
-        return web.json_response(
-            {"object": "hermes.session.chat.completion",
-             "session_id": effective_session_id or session_id,
-             "message": {"role": "assistant", "content": final_response}, "usage": usage,
-             "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)},
-            headers=headers)
+        payload = {"object": "hermes.session.chat.completion",
+                   "session_id": effective_session_id or session_id,
+                   "message": {"role": "assistant", "content": final_response}, "usage": usage,
+                   "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)}
+        if _honcho_profile_apps_enabled() and is_dict:
+            apps = self._honcho_turn_apps(history, ctx["user_message"], result)
+            if apps:
+                payload["apps"] = apps
+        return web.json_response(payload, headers=headers)
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
@@ -3198,6 +3324,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "messages": turn_messages, "usage": usage, "runtime": effective_runtime}
                 if pending_steer:
                     completed_payload["pending_steer"] = pending_steer
+                if _honcho_profile_apps_enabled() and is_dict:
+                    _apps = self._honcho_turn_apps(history, user_message, result)
+                    if _apps:
+                        completed_payload["apps"] = _apps
                 await queue.put(_event_payload("run.completed", completed_payload))
                 self._set_run_status(
                     run_id, "completed", session_id=effective_session_id, usage=usage,
@@ -3653,6 +3783,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         _session_rotated = isinstance(_eff_sid, str) and isinstance(session_id, str) and _eff_sid != session_id
         if getattr(agent, "_last_compaction_in_place", False) or _session_rotated:
             result["_compressed"] = True
+        # Opt-in: resolve peer aliases while the agent (and its Honcho provider) is still alive.
+        if _honcho_profile_apps_enabled() and isinstance(result, dict):
+            result["honcho_profile_targets"] = _honcho_profile_targets(agent, result)
         if requested_runtime or route or confirmed_runtime_lock or (route_source and route_source != "global"):
             runtime = self._turn_runtime_metadata(
                 agent, route=route, requested_runtime=requested_runtime,
