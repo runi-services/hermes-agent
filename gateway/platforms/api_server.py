@@ -4787,12 +4787,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "runtime": runtime,
         }
         if _honcho_profile_apps_enabled() and isinstance(result, dict):
-            apps = _honcho_profile_apps(
-                (result.get("messages") or [])[
-                    self._response_messages_turn_start_index(history, user_message, result):
-                ],
-                result.get("honcho_profile_targets"),
-            )
+            apps = self._honcho_turn_apps(history, user_message, result)
             if apps:
                 payload["apps"] = apps
         return web.json_response(payload, headers=headers)
@@ -4982,12 +4977,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if pending_steer:
                     completed_payload["pending_steer"] = pending_steer
                 if _honcho_profile_apps_enabled() and isinstance(result, dict):
-                    _apps = _honcho_profile_apps(
-                        (result.get("messages") or [])[
-                            self._response_messages_turn_start_index(history, user_message, result):
-                        ],
-                        result.get("honcho_profile_targets"),
-                    )
+                    _apps = self._honcho_turn_apps(history, user_message, result)
                     if _apps:
                         completed_payload["apps"] = _apps
                 await queue.put(_event_payload("run.completed", completed_payload))
@@ -7110,6 +7100,27 @@ class APIServerAdapter(BasePlatformAdapter):
         if prior and agent_messages[:len(prior)] == prior:
             return len(prior)
         return 0
+
+    @classmethod
+    def _honcho_turn_apps(
+        cls,
+        conversation_history: List[Dict[str, Any]],
+        user_message: Any,
+        result: Dict[str, Any],
+    ) -> List[Dict[str, str]]:
+        """Peer-card apps for this turn only; none if the turn start is unknown.
+
+        A turn-start index of 0 means the transcript no longer starts with the
+        history (e.g. compression rewrote it). Never fall back to the whole
+        transcript: that would replay earlier turns' cards.
+        """
+        start = cls._response_messages_turn_start_index(conversation_history, user_message, result)
+        if not start:
+            return []
+        return _honcho_profile_apps(
+            (result.get("messages") or [])[start:],
+            result.get("honcho_profile_targets"),
+        )
 
     @classmethod
     def _turn_transcript_messages(

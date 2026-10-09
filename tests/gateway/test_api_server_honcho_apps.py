@@ -214,3 +214,15 @@ def test_provider_resolve_profile_target_uses_get_peer_card_resolution():
     assert prov.resolve_profile_target("some peer") == "some-peer"
     prov._session_key = "missing"
     assert prov.resolve_profile_target("user") is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_turn_start_gives_no_apps(monkeypatch):
+    """Transcript rewritten (e.g. compressed): history is not its prefix -> no apps."""
+    history = [{"role": "user", "content": "old"}, {"role": "assistant", "content": "old answer"}]
+    result = _result([_call("c1", "honcho_profile", {})], [CARD], {"user": "runi"})
+    result["_compressed"] = True
+    body = await _post(result, monkeypatch=monkeypatch, history=history)
+    assert "apps" not in body
+    stream = await _post(result, stream=True, monkeypatch=monkeypatch, history=history)
+    assert '"apps"' not in stream
