@@ -2926,6 +2926,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        user_id: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3228,6 +3229,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "enabled_toolsets": enabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
+            "user_id": user_id,
             "stream_delta_callback": stream_delta_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
@@ -5119,6 +5121,41 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "runtime": runtime,
         })
+    async def _chat_user_owner_error(self, session_id: str, user_id: Optional[str]):
+        """Claim a fresh private-body session; never rebind an existing owner.
+
+        Native SessionDB's upsert deliberately never updates user_id. Re-reading
+        after create also detects a competing first writer before any history
+        read or agent/memory initialization. Legacy NULL owners stay NULL.
+        """
+        try:
+            db = await self._ensure_session_db_async()
+            if db is None:
+                if user_id is None:
+                    return None
+                raise RuntimeError("Session database unavailable")
+
+            def check_owner():
+                row = db.get_session(session_id)
+                if row is None:
+                    # Also reserve anonymous sessions: otherwise a simultaneous
+                    # identified request could claim the ID after this check.
+                    db.create_session(session_id, "api_server", user_id=user_id)
+                    row = db.get_session(session_id)
+                    if row is None:
+                        raise RuntimeError("Session owner was not persisted")
+                return row is not None and row.get("user_id") != user_id
+
+            mismatch = await asyncio.to_thread(check_owner)
+        except Exception:
+            logger.warning("Cannot verify chat session owner", exc_info=True)
+            return web.json_response(_openai_error(
+                "Cannot verify session owner", code="session_owner_unavailable"), status=503)
+        if mismatch:
+            return web.json_response(_openai_error(
+                "Session owner mismatch; start a fresh session", code="session_owner_mismatch"), status=409)
+        return None
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -5132,6 +5169,24 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except (json.JSONDecodeError, Exception):
             return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Request body must be an object"), status=400)
+        user_id = None
+        if "user_id" in body:
+            # This is trusted private-broker attribution, NOT proof of login.
+            # Never accept it on a guest/session-auth leg or an unkeyed listener.
+            expected_key = self._expected_api_key()
+            authorization = request.headers.get("Authorization", "")
+            if (not expected_key or not authorization.startswith("Bearer ")
+                    or not hmac.compare_digest(authorization[7:].strip().encode(), expected_key.encode())):
+                return web.json_response(_openai_error(
+                    "user_id requires private API key authentication", code="user_id_requires_private_key"), status=403)
+            user_id = body["user_id"]
+            if (not isinstance(user_id, str) or not user_id or len(user_id) > 256
+                    or user_id != user_id.strip() or not user_id.isprintable()):
+                return web.json_response(_openai_error(
+                    "Invalid user_id", code="invalid_user_id"), status=400)
 
         messages = body.get("messages")
         if not messages or not isinstance(messages, list):
@@ -5225,13 +5280,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -5242,8 +5290,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 if cm.get("role") == "user":
                     first_user = cm.get("content", "")
                     break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
+            # Preserve the legacy fingerprint for callers without attribution;
+            # identified people asking the same question must not share a row.
+            identity_seed = (json.dumps([user_id, first_user], ensure_ascii=False)
+                             if user_id is not None else first_user)
+            session_id = _derive_chat_session_id(system_prompt, identity_seed)
             # history already set from request body above
+
+        owner_err = await self._chat_user_owner_error(session_id, user_id)
+        if owner_err is not None:
+            return owner_err
+        if provided_session_id:
+            try:
+                db = await self._ensure_session_db_async()
+                if db is not None:
+                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            except Exception as e:
+                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                history = []
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -5351,6 +5415,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 **agent_overrides,
                 route=route,
             ))
@@ -5372,6 +5437,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 **agent_overrides,
                 route=route,
             )
@@ -5380,10 +5446,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream", "user_id"],
             )
+            # The receiving profile, asserted person and persisted session delimit
+            # replay custody; a matching body is not a matching conversation.
+            cache_key = json.dumps([_api_request_profile.get(), session_id, user_id, idempotency_key])
             try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                result, usage = await _idem_cache.get_or_set(cache_key, fp, _compute_completion)
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -7320,6 +7389,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        user_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7391,6 +7461,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        user_id=user_id,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent

@@ -2339,6 +2339,9 @@ class TestSessionIdHeader:
             {"role": "assistant", "content": "stored reply 1"},
         ]
         mock_db = MagicMock()
+        # The private-body owner gate now checks the native session row first.
+        # This legacy caller has no asserted person; preserve its NULL owner.
+        mock_db.get_session.return_value = {"user_id": None}
         mock_db.get_messages_as_conversation.return_value = db_history
         auth_adapter._session_db = mock_db
         app = _create_app(auth_adapter)
