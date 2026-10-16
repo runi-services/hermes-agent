@@ -23,6 +23,52 @@ import tools.lazy_deps as ld
 # ---------------------------------------------------------------------------
 
 
+def test_otlp_api_sdk_exporter_pins_are_aligned():
+    """The SDK imports private API types; do not leave the API a loose install."""
+    from pathlib import Path
+    import tomllib
+    from packaging.requirements import Requirement
+
+    data = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())
+    specs = data["project"]["optional-dependencies"]["otlp"]
+    family = {Requirement(spec).name: str(Requirement(spec).specifier) for spec in specs}
+    expected = {"opentelemetry-api", "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-http"}
+    assert expected <= family.keys()
+    assert len({family[name] for name in expected}) == 1
+    assert all(family[name].startswith("==") for name in expected)
+    assert set(ld.LAZY_DEPS["export.otlp"]) == set(specs)
+
+
+def test_core_fastapi_pin_matches_web_extra():
+    """A core-only install must not upgrade FastAPI/API behind a pinned OTLP SDK."""
+    from pathlib import Path
+    import tomllib
+    from packaging.requirements import Requirement
+
+    data = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())["project"]
+    core = {Requirement(spec).name: str(Requirement(spec).specifier) for spec in data["dependencies"]}
+    web = {Requirement(spec).name: str(Requirement(spec).specifier) for spec in data["optional-dependencies"]["web"]}
+    assert core["fastapi"] == web["fastapi"]
+    assert core["fastapi"].startswith("==")
+
+
+def test_teams_lazy_sdk_family_matches_locked_extra():
+    """A lazy Teams install must not resolve a newer API with a new OTel floor."""
+    from pathlib import Path
+    import tomllib
+    from packaging.requirements import Requirement
+
+    root = Path(__file__).resolve().parents[2]
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    specs = project["optional-dependencies"]["teams"]
+    family = {Requirement(spec).name: str(Requirement(spec).specifier) for spec in specs}
+    names = {"microsoft-teams-apps", "microsoft-teams-api", "microsoft-teams-cards", "microsoft-teams-common"}
+    assert names <= family.keys()
+    locked = {p["name"]: p["version"] for p in tomllib.loads((root / "uv.lock").read_text())["package"]}
+    assert all(family[name] == "==" + locked[name] for name in names)
+    assert set(ld.LAZY_DEPS["platform.teams"]) == set(specs)
+
+
 class TestSpecSafety:
     @pytest.mark.parametrize("spec", [
         "mistralai>=2.3.0,<3",
