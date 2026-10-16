@@ -62,11 +62,15 @@ def _hydrate_auth(auth: dict) -> dict:
         return out
     try:
         path = os.path.expanduser(out["token_file"])
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        getuid = getattr(os, "getuid", None)
+        if nofollow is None or getuid is None:
+            raise ValueError
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0)
         fd = os.open(path, flags)
         with os.fdopen(fd, "rb") as handle:
             info = os.fstat(handle.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != getuid()
                     or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
                 raise ValueError
             raw = handle.read(4099)

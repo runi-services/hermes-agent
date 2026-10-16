@@ -42,6 +42,7 @@ tools = sys.modules[PKG + '.tools']
 protocol = sys.modules[PKG + '.protocol']
 security = sys.modules[PKG + '.security']
 
+@unittest.skipUnless(os.name == 'posix', 'POSIX protected-file fixtures')
 class PrivateSender(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
@@ -139,5 +140,11 @@ class PrivateSender(unittest.TestCase):
     def test_unrestricted_inline_compatibility(self):
         self.assertEqual(tools._auth_header({'type': 'bearer', 'token': 'fixture-inline'}), {'Authorization': 'Bearer fixture-inline'})
         self.assertEqual(tools._auth_header({}), {})
+
+class UnsupportedFileCustody(unittest.TestCase):
+    def test_missing_secure_primitive_returns_sanitized_refusal(self):
+        with patch.object(os, 'O_NOFOLLOW', None, create=True):
+            with self.assertRaisesRegex(ValueError, '^Configured A2A bearer file is unreadable, insecure, or invalid$'):
+                tools._auth_header({'type': 'bearer', 'token_file': '/never/read', 'token': 'no-fallback'})
 
 if __name__ == '__main__': unittest.main(verbosity=2)
