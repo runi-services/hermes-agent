@@ -23,6 +23,22 @@ import tools.lazy_deps as ld
 # ---------------------------------------------------------------------------
 
 
+def test_otlp_api_sdk_exporter_pins_are_aligned():
+    """The SDK imports private API types; do not leave the API a loose install."""
+    from pathlib import Path
+    import tomllib
+    from packaging.requirements import Requirement
+
+    data = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())
+    specs = data["project"]["optional-dependencies"]["otlp"]
+    family = {Requirement(spec).name: str(Requirement(spec).specifier) for spec in specs}
+    expected = {"opentelemetry-api", "opentelemetry-sdk", "opentelemetry-exporter-otlp-proto-http"}
+    assert expected <= family.keys()
+    assert len({family[name] for name in expected}) == 1
+    assert all(family[name].startswith("==") for name in expected)
+    assert set(ld.LAZY_DEPS["export.otlp"]) == set(specs)
+
+
 class TestSpecSafety:
     @pytest.mark.parametrize("spec", [
         "mistralai>=2.3.0,<3",
