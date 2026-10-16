@@ -27,14 +27,14 @@ def test_peer_scope_routes_new_contexts_to_same_gateway_session():
             terminal, pending = await asyncio.to_thread(
                 adapter._prepare_task,
                 {"message": protocol.text_message(protocol.ROLE_USER, "follow up", context_id=ctx)},
-                "abel",
+                "peer-a",
             )
             assert terminal is None and pending is not None
             assert pending["context_id"] == ctx
         await asyncio.sleep(0)
         first, second = events.get_nowait(), events.get_nowait()
         assert build_session_key(first.source) == build_session_key(second.source)
-        assert first.source.user_id == second.source.user_id == "abel"
+        assert first.source.user_id == second.source.user_id == "peer-a"
         assert first.message_id != second.message_id
 
     asyncio.run(exercise())
@@ -42,7 +42,7 @@ def test_peer_scope_routes_new_contexts_to_same_gateway_session():
 
 def test_peer_replies_settle_only_the_exact_task():
     adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"session_scope": "peer"}))
-    chat_id = adapter._session_chat_id("abel", "old", adapter._agents[""])
+    chat_id = adapter._session_chat_id("peer-a", "old", adapter._agents[""])
     first = adapter._add_pending("task-a", chat_id)
     second = adapter._add_pending("task-b", chat_id)
 
@@ -66,8 +66,8 @@ def test_peer_replies_settle_only_the_exact_task():
 def test_context_scope_preserves_existing_routing_and_unbound_reply(extra):
     adapter = A2AAdapter(PlatformConfig(enabled=True, extra=extra))
     agent = adapter._agents[""]
-    assert adapter._session_chat_id("abel", "ctx/exact", agent) == "ctx/exact"
-    assert adapter._session_chat_id("james", "ctx/exact", agent) == "ctx/exact"
+    assert adapter._session_chat_id("peer-a", "ctx/exact", agent) == "ctx/exact"
+    assert adapter._session_chat_id("peer-b", "ctx/exact", agent) == "ctx/exact"
     future = adapter._add_pending("task-context", "ctx/exact")
     asyncio.run(adapter.send("ctx/exact", "legacy", metadata={"notify": True}))
     assert future.result(timeout=0) == (protocol.STATE_COMPLETED, "legacy")
@@ -97,8 +97,8 @@ def test_real_http_auth_base_dispatch_session_store_and_task_reply(tmp_path, mon
 
     Only the model is replaced. No live profiles, credentials, or peer sends.
     """
-    monkeypatch.setenv("A2A_PEER_TOKENS", "abel:synthetic-abel,james:synthetic-james")
-    monkeypatch.setenv("A2A_TRUSTED_PEERS", "abel,james")
+    monkeypatch.setenv("A2A_PEER_TOKENS", "peer-a:synthetic-peer-a,peer-b:synthetic-peer-b")
+    monkeypatch.setenv("A2A_TRUSTED_PEERS", "peer-a,peer-b")
     monkeypatch.setenv("A2A_HOST", "127.0.0.1")
     monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
     monkeypatch.delenv("A2A_PORT", raising=False)
@@ -132,8 +132,8 @@ def test_real_http_auth_base_dispatch_session_store_and_task_reply(tmp_path, mon
             assert error.value.code == 401
             assert received == []
             handles = []
-            for ctx, token in (("first-context", "synthetic-abel"), ("new-context", "synthetic-abel"),
-                               ("first-context", "synthetic-james")):
+            for ctx, token in (("first-context", "synthetic-peer-a"), ("new-context", "synthetic-peer-a"),
+                               ("first-context", "synthetic-peer-b")):
                 receipt = await asyncio.to_thread(post, ctx, token)
                 task = receipt["result"].get("task", receipt["result"])
                 handles.append(task["id"])
@@ -146,9 +146,9 @@ def test_real_http_auth_base_dispatch_session_store_and_task_reply(tmp_path, mon
                 assert record["state"] == protocol.STATE_COMPLETED
                 assert record["reply"] == f"ANSWER-{len(handles)}"
             assert len(set(handles)) == 3
-            assert received[0][0] == received[1][0] == "abel"
+            assert received[0][0] == received[1][0] == "peer-a"
             assert received[0][1:3] == received[1][1:3]
-            assert received[2][0] == "james"
+            assert received[2][0] == "peer-b"
             assert received[2][1] != received[0][1]
             assert received[2][2] != received[0][2]
         finally:
