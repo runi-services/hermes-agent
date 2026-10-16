@@ -4,7 +4,7 @@ index 36ac5d60be..edfdef4200 100644
 +++ b/plugins/platforms/a2a/adapter.py
 @@ -6,6 +6,7 @@ Future the HTTP handler blocks on. No token configured => binds 127.0.0.1 only."
  from __future__ import annotations
- 
+
  import asyncio
 +import hashlib
  import contextlib
@@ -23,7 +23,7 @@ index 36ac5d60be..edfdef4200 100644
 @@ -529,6 +533,18 @@ class A2AAdapter(BasePlatformAdapter):
          protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
          return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
- 
+
 +    def _session_chat_id(self, peer: str, context_id: str, agent: dict) -> str:
 +        """Select a gateway conversation without changing the protocol context.
 +
@@ -54,7 +54,7 @@ index 36ac5d60be..edfdef4200 100644
          except Exception as e:
 @@ -830,14 +847,26 @@ class A2AAdapter(BasePlatformAdapter):
          logger.debug("A2A: push notification sent for task %s", task_id)
- 
+
      async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None):
 -        """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
 -        Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
@@ -83,6 +83,6 @@ index 36ac5d60be..edfdef4200 100644
 +        else:
 +            logger.debug("A2A: ignoring unbound final send for peer chat %s", chat_id)
 +        return SendResult(success=True, message_id=message_id)
- 
+
      async def send_typing(self, chat_id: str, metadata=None) -> None:
          return None
