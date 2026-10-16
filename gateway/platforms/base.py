@@ -2726,6 +2726,9 @@ def merge_pending_message_event(
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
+            absorb = getattr(existing, "absorb_reply_expected", None)
+            if absorb is not None:
+                absorb(event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2745,6 +2748,9 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
+            absorb = getattr(existing, "absorb_reply_expected", None)
+            if absorb is not None:
+                absorb(event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2755,6 +2761,9 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            absorb = getattr(existing, "absorb_reply_expected", None)
+            if absorb is not None:
+                absorb(event)
             return
 
     pending_messages[session_key] = event
@@ -5729,6 +5738,9 @@ class BasePlatformAdapter(ABC):
                     if state.event.text
                     else event.text
                 )
+            absorb = getattr(state.event, "absorb_reply_expected", None)
+            if absorb is not None:
+                absorb(event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
