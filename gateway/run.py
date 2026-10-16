@@ -3878,7 +3878,10 @@ def _parse_session_key(session_key: str) -> "dict | None":
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
-        if len(parts) > 5 and parts[3] in {"dm", "thread"}:
+        if parts[2:4] == ["a2a", "peer-dm"]:
+            result["chat_type"] = "dm"
+            result["scope_id"] = "peer"
+        if len(parts) > 5 and result["chat_type"] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
         return result
     return None
@@ -25137,6 +25140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+        derived_scope_id = ""
 
         if session_key:
             try:
@@ -25160,6 +25164,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                derived_scope_id = _parsed.get("scope_id", "")
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
@@ -25193,7 +25198,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
-        scope_id = str(evt.get("scope_id") or "").strip() or None
+        scope_id = str(evt.get("scope_id") or derived_scope_id or "").strip() or None
         if scope_id is None and chat_type not in ("dm", "thread"):
             # Reconstructed (non-persisted) source for a scoped chat with no
             # scope discriminator: on a relay-fronted deployment the

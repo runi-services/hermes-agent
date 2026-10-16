@@ -1,5 +1,49 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index a9e9855ec9..15991d19c5 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -2972,7 +2972,10 @@ def _parse_session_key(session_key: str) -> dict | None:
+         result = {"platform": parts[2], "chat_type": parts[3], "chat_id": parts[4]}
+         if parts[1] != "main":
+             result["profile"] = profile_from_session_key_namespace(parts[1])
+-        if len(parts) > 5 and parts[3] in {"dm", "thread"}:
++        if parts[2:4] == ["a2a", "peer-dm"]:
++            result["chat_type"] = "dm"
++            result["scope_id"] = "peer"
++        if len(parts) > 5 and result["chat_type"] in {"dm", "thread"}:
+             result["thread_id"] = parts[5]
+         return result
+     return None
+diff --git a/gateway/run_notifications.py b/gateway/run_notifications.py
+index 75c5a125ce..a077b39140 100644
+--- a/gateway/run_notifications.py
++++ b/gateway/run_notifications.py
+@@ -977,7 +977,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
+         def _opt(field: str) -> Optional[str]:
+             return str(evt.get(field) or "").strip() or None
+
+-        scope_id = _opt("scope_id")
++        scope_id = _opt("scope_id") or derived.get("scope_id")
+         if scope_id is None and chat_type not in ("dm", "thread"):
+             # Reconstructed scoped-chat source without scope_id: a relay connector's tenant guard may
+             # decline the reply. Warn, don't fail (native adapters need no scope_id).
+diff --git a/gateway/session.py b/gateway/session.py
+index 295e8b797c..24126764a0 100644
+--- a/gateway/session.py
++++ b/gateway/session.py
+@@ -714,6 +714,10 @@ def build_session_key(
+     # Duck-typed sources may lack user_id_alt: read the participant only when it matters.
+     participant_id = _canonical_participant(source) if (isolate_user or not is_dm) else None
+
++    # Peer-scoped A2A uses a fixed key slot disjoint from legacy DM context
++    # ids; the source remains a DM so chat/queue policy does not change.
++    if is_dm and source.platform.value == "a2a" and source.scope_id == "peer":
++        chat_type_slot = "peer-dm"
+     parts = [_session_key_namespace(profile), source.platform.value, chat_type_slot]
+     if source.platform == Platform.SLACK and source.scope_id:
+         parts.append(str(source.scope_id))
 diff --git a/plugins/platforms/a2a/adapter.py b/plugins/platforms/a2a/adapter.py
-index 36ac5d60be..edfdef4200 100644
+index 36ac5d60be..ea81084b39 100644
 --- a/plugins/platforms/a2a/adapter.py
 +++ b/plugins/platforms/a2a/adapter.py
 @@ -6,6 +6,7 @@ Future the HTTP handler blocks on. No token configured => binds 127.0.0.1 only."
@@ -39,7 +83,7 @@ index 36ac5d60be..edfdef4200 100644
      def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
          """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
          (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
-@@ -561,9 +577,10 @@ class A2AAdapter(BasePlatformAdapter):
+@@ -561,9 +577,11 @@ class A2AAdapter(BasePlatformAdapter):
                  self._pop_pending(task_id)
          if self._loop is None or self._message_handler is None:
              return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
@@ -48,11 +92,12 @@ index 36ac5d60be..edfdef4200 100644
 +        fut = self._add_pending(task_id, chat_id)
          event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
 -                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
-+                             source=self.build_source(chat_id=chat_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
++                             source=self.build_source(chat_id=chat_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer,
++                                                      scope_id="peer" if self.session_scope == "peer" else None))
          try:
              asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
          except Exception as e:
-@@ -830,14 +847,26 @@ class A2AAdapter(BasePlatformAdapter):
+@@ -830,14 +848,26 @@ class A2AAdapter(BasePlatformAdapter):
          logger.debug("A2A: push notification sent for task %s", task_id)
 
      async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None):

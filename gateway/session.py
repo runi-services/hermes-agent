@@ -1137,7 +1137,10 @@ def build_session_key(
         if source.platform == Platform.WHATSAPP:
             dm_chat_id = canonical_whatsapp_identifier(source.chat_id)
 
-        dm_parts = [ns, platform, "dm"]
+        # Peer-scoped A2A occupies a distinct fixed key slot, not a prefix on
+        # caller-controlled chat/context ids. Keep the source a DM for policy.
+        dm_slot = "peer-dm" if platform == "a2a" and source.scope_id == "peer" else "dm"
+        dm_parts = [ns, platform, dm_slot]
         if slack_scope_id:
             dm_parts.append(slack_scope_id)
         if dm_chat_id:

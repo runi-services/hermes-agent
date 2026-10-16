@@ -857,6 +857,7 @@ class A2AAdapter(BasePlatformAdapter):
             media_types=media_types,
             source=self.build_source(
                 chat_id=chat_id,
+                scope_id="peer" if self.session_scope == "peer" else None,
                 chat_name=f"a2a:{peer}",
                 chat_type="dm",
                 user_id=peer,

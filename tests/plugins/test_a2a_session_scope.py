@@ -155,3 +155,68 @@ def test_real_http_auth_base_dispatch_session_store_and_task_reply(tmp_path, mon
             await adapter.disconnect()
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("legacy_sender", ["peer-a", "peer-b"])
+def test_peer_scope_never_adopts_legacy_context_session(tmp_path, legacy_sender):
+    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"session_scope": "peer"}))
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    chat_id = adapter._session_chat_id("peer-a", "fresh-context", adapter._agents[""])
+    legacy_source = adapter.build_source(chat_id=chat_id, chat_type="dm", user_id=legacy_sender)
+    legacy = store.get_or_create_session(legacy_source)
+    received = Queue()
+
+    async def receive(event):
+        received.put(event.source)
+
+    async def exercise():
+        adapter._loop = asyncio.get_running_loop()
+        adapter._message_handler = receive
+        terminal, pending = await asyncio.to_thread(adapter._prepare_task, {
+            "message": protocol.text_message(protocol.ROLE_USER, "fresh", context_id="fresh-context")
+        }, "peer-a")
+        assert terminal is None and pending is not None
+        await asyncio.sleep(0)
+        source = received.get_nowait()
+        current = store.get_or_create_session(source)
+        assert current.session_id != legacy.session_id
+        assert build_session_key(source) != build_session_key(legacy_source)
+        assert current.origin.user_id == "peer-a"
+        assert store.get_or_create_session(legacy_source).session_id == legacy.session_id
+        assert legacy.origin.user_id == legacy_sender
+        assert source.chat_type == "dm", "peer namespace must not change chat/queue semantics"
+
+    asyncio.run(exercise())
+
+
+def test_peer_namespace_roundtrips_native_key_parser():
+    from gateway.run import _parse_session_key
+
+    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"session_scope": "peer"}))
+    source = adapter.build_source(chat_id="stable-peer-id", chat_type="dm", user_id="peer-a", scope_id="peer")
+    parsed = _parse_session_key(build_session_key(source))
+    assert parsed is not None
+    assert parsed["chat_type"] == "dm"
+    assert parsed["scope_id"] == "peer"
+    assert build_session_key(adapter.build_source(
+        chat_id=parsed["chat_id"], chat_type=parsed["chat_type"], scope_id=parsed["scope_id"], user_id="peer-a"
+    )) == build_session_key(source)
+
+
+def test_background_source_fallback_retains_peer_namespace(monkeypatch):
+    from types import SimpleNamespace
+    from gateway.run import GatewayRunner
+    from gateway.platform_registry import platform_registry
+
+    # This unit fixture has not run gateway plugin discovery.
+    monkeypatch.setattr(platform_registry, "is_registered", lambda platform: platform == "a2a")
+
+    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"session_scope": "peer"}))
+    source = adapter.build_source(chat_id="stable-peer-id", chat_type="dm", user_id="peer-a", scope_id="peer")
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.session_store = SimpleNamespace(_ensure_loaded=lambda: None, _entries={})
+    runner._get_cached_session_source = lambda key: None
+    recovered = runner._build_process_event_source({"session_key": build_session_key(source)})
+    assert recovered is not None
+    assert recovered.scope_id == "peer"
+    assert build_session_key(recovered) == build_session_key(source)
