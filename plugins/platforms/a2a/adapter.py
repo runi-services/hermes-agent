@@ -30,6 +30,7 @@ Bind safety: with no token configured, the server binds 127.0.0.1 only.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -355,6 +356,9 @@ class A2AAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=platform)
 
         extra = getattr(config, "extra", {}) or {}
+        self.session_scope = extra.get("session_scope", "context")
+        if self.session_scope not in ("context", "peer"):
+            raise ValueError("A2A session_scope must be 'context' or 'peer'")
         self.port = int(os.getenv("A2A_PORT") or extra.get("port", _DEFAULT_PORT))
         self.reply_timeout = _parse_reply_timeout(
             extra.get("reply_timeout", _reply_timeout()),
@@ -725,6 +729,18 @@ class A2AAdapter(BasePlatformAdapter):
 
     # ── Inbound task handling ─────────────────────────────────────────────
 
+    def _session_chat_id(self, peer: str, context_id: str, agent: dict) -> str:
+        """Select a gateway conversation without changing the protocol context.
+
+        The peer is supplied by HTTP authentication, never message metadata.
+        Use an unambiguous encoding so tenant/agent/peer names cannot collide.
+        """
+        if self.session_scope == "context":
+            return context_id
+        identity = [self._active_profile, *self._scope_for_agent(agent), peer]
+        digest = hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode("utf-8")).hexdigest()
+        return f"peer-{digest}"
+
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message.
 
@@ -831,7 +847,8 @@ class A2AAdapter(BasePlatformAdapter):
                 created_at=rec["created_iso"],
             ), None
 
-        fut = self._add_pending(task_id, context_id)
+        chat_id = self._session_chat_id(peer, context_id, agent)
+        fut = self._add_pending(task_id, chat_id)
 
         event = MessageEvent(
             text=framed,
@@ -839,7 +856,7 @@ class A2AAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             source=self.build_source(
-                chat_id=context_id,
+                chat_id=chat_id,
                 chat_name=f"a2a:{peer}",
                 chat_type="dm",
                 user_id=peer,
@@ -1323,25 +1340,25 @@ class A2AAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Fulfil the pending reply Future for this context.
+        """Settle the triggering task, not another waiter sharing its session.
 
-        ``chat_id`` is the A2A context id we set as the source chat_id; the
-        oldest outstanding task for that context receives the reply (the
-        gateway session processes messages in order).
-
-        The gateway marks final user-visible replies with ``metadata['notify']``
-        (see ``_mark_notify_metadata`` in gateway.platforms.base — this is the
-        base adapter's documented reply marker, not an incidental field).
-        Progress, status, and editable preview sends intentionally lack the
-        marker; those must not satisfy the JSON-RPC caller.
+        Peer-scoped chats can contain several protocol contexts. A final reply
+        therefore requires the gateway's immutable triggering message id. Keep
+        the legacy context FIFO only for unbound context-scoped sends.
         """
         message_id = str(int(time.time() * 1000))
         if not (metadata or {}).get("notify"):
-            logger.debug("A2A: ignoring non-final send for context %s", chat_id)
             return SendResult(success=True, message_id=message_id)
-        if not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
-            # No waiter (e.g. a late chunk or out-of-band send) — drop it.
-            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+        task_id = reply_to or (metadata or {}).get("reply_to_message_id")
+        if task_id:
+            with self._pending_lock:
+                entry = self._pending.get(str(task_id))
+                if entry and entry[0] == chat_id and not entry[1].done():
+                    entry[1].set_result((protocol.STATE_COMPLETED, content or ""))
+        elif self.session_scope == "context":
+            self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or "")
+        else:
+            logger.debug("A2A: ignoring unbound final send for peer chat %s", chat_id)
         return SendResult(success=True, message_id=message_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
