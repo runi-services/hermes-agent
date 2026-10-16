@@ -83,7 +83,7 @@ For the native live gateway route, `gateway.platforms.a2a.extra.session_scope` a
 
 Wire task IDs, context IDs, audit/journal correlation, anti-loop limits and final replies remain per protocol task/context. Peer scope changes only gateway conversation selection; it does not change busy/queue/stop policy. Replies must name their triggering task so one context cannot settle a sibling task. Legacy subprocess-forwarded profile routes retain their existing context routing; this option applies to the native live route only.
 
-**Forward-only activation:** changing scope opens new peer-keyed sessions. Existing context sessions and history remain untouched. There is no automatic migration, rebind, or history merge. Activate at the receiving seat's drained minute, then prove two messages from the same authenticated peer on different contexts reach one new session.
+**Forward-only activation:** changing scope opens new peer-keyed sessions. Peer selection uses a fixed `peer-dm` key namespace, stamped by the adapter through source scope metadata; a caller-chosen legacy context ID cannot alias it. Source chat type remains `dm`, and parser/background-event recovery preserve that scope. Existing context sessions and history remain untouched. There is no automatic migration, rebind, or history merge. Activate at the receiving seat's drained minute, then prove two messages from the same authenticated peer on different contexts reach one new session.
 
 Interoperability is verified against the official Python `a2a-sdk` (card resolution, `SendMessage`, streaming).
 
