@@ -111,7 +111,9 @@ dependencies = [
   "websockets==15.0.1",
   # .gitignore-aware file matching for desktop build stamp.
   "pathspec==1.1.1",
-  "fastapi>=0.104.0,<1",
+  # Match the web extra: newer FastAPI releases pull an OTel API incompatible
+  # with the pinned optional SDK. Core-only installs must preserve that family.
+  "fastapi==0.133.1",
   "uvicorn[standard]>=0.24.0,<1",
   # Streaming multipart uploads for the dashboard file manager (NS-501).
   # FastAPI's UploadFile/Form depend on python-multipart; it is NOT pulled in

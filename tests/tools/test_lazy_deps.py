@@ -39,6 +39,19 @@ def test_otlp_api_sdk_exporter_pins_are_aligned():
     assert set(ld.LAZY_DEPS["export.otlp"]) == set(specs)
 
 
+def test_core_fastapi_pin_matches_web_extra():
+    """A core-only install must not upgrade FastAPI/API behind a pinned OTLP SDK."""
+    from pathlib import Path
+    import tomllib
+    from packaging.requirements import Requirement
+
+    data = tomllib.loads((Path(__file__).resolve().parents[2] / "pyproject.toml").read_text())["project"]
+    core = {Requirement(spec).name: str(Requirement(spec).specifier) for spec in data["dependencies"]}
+    web = {Requirement(spec).name: str(Requirement(spec).specifier) for spec in data["optional-dependencies"]["web"]}
+    assert core["fastapi"] == web["fastapi"]
+    assert core["fastapi"].startswith("==")
+
+
 class TestSpecSafety:
     @pytest.mark.parametrize("spec", [
         "mistralai>=2.3.0,<3",
