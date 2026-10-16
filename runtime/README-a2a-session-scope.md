@@ -8,6 +8,8 @@ Acceptance measured before publication:
 - Fork main focused A2A set: 175 passed.
 - Fork broader set including phase23: 227 passed, 2 failed. Both failures reproduce on unchanged fork base `97ffb4d7cb38d1916682d3b89939fde38282b0c0`: anti-loop and latency tests expect synchronous SendMessage completion although that base now returns a working receipt. No assertions were weakened.
 - Release backport plus native A2A tests: 171 passed, 1 skipped.
+- Unchanged installed task-lifetime plugin suite against the backport: 65 passed (copied into the disposable test tree with its manifest and supporting files; synthetic unlisted-version allowance only).
+- Real HTTP peer-scope/session-store proof with that plugin applied: 1 passed. Both named peers remain separate and both Abel contexts settle their own tasks.
 - New routing and wrong-task reply regressions each failed behaviorally before their implementation, then passed.
 
 ## Activation boundary
