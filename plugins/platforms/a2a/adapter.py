@@ -369,7 +369,7 @@ class A2APeerMessageEvent(MessageEvent):
             own = (self.source.user_id, self.source.chat_id, self.source.scope_id)
             theirs = (other.source.user_id, other.source.chat_id, other.source.scope_id)
             if own == theirs:
-                self._reply_task_ids = list(dict.fromkeys(self._reply_task_ids + other._reply_task_ids))
+                self._reply_task_ids.extend(owner for owner in other._reply_task_ids if owner not in self._reply_task_ids)
 
 
 class A2AAdapter(BasePlatformAdapter):
@@ -422,7 +422,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._pending: Dict[str, tuple[str, Future]] = {}
         self._pending_order: Dict[str, deque[str]] = {}
         self._pending_lock = threading.Lock()
-        self._processing_reply_groups: dict[str, tuple[str, ...]] = {}
+        self._processing_reply_groups: dict[str, list[str]] = {}
 
         # Orphaned task watchdog
         self._watchdog_stop = threading.Event()
@@ -730,11 +730,22 @@ class A2AAdapter(BasePlatformAdapter):
         entry[1].set_result((state, text))
         return True
 
+    def _reply_owners_for_task(self, task_id: str) -> tuple[str, ...]:
+        """Exact server-owned turn membership, including inputs injected mid-run.
+
+        Callers hold _pending_lock. A running event retains its mutable owner
+        list so an accepted steer/redirect can extend it after processing starts.
+        """
+        for anchor, owners in getattr(self, "_processing_reply_groups", {}).items():
+            if task_id == anchor or task_id in owners:
+                return tuple(owners)
+        return (task_id,)
+
     def _resolve_task(self, task_id: str, state: str, text: str) -> bool:
         with self._pending_lock:
             # A normal final answers every input actually absorbed by this
             # processing turn. Protocol cancellation remains exact-task only.
-            owners = (getattr(self, "_processing_reply_groups", {}).get(task_id, (task_id,))
+            owners = (self._reply_owners_for_task(task_id)
                       if state == protocol.STATE_COMPLETED else (task_id,))
             landed = False
             for owner in owners:
@@ -1389,7 +1400,7 @@ class A2AAdapter(BasePlatformAdapter):
         task_id = reply_to or (metadata or {}).get("reply_to_message_id")
         if task_id:
             with self._pending_lock:
-                owners = getattr(self, "_processing_reply_groups", {}).get(str(task_id), (str(task_id),))
+                owners = self._reply_owners_for_task(str(task_id))
                 for owner in owners:
                     entry = self._pending.get(owner)
                     if entry and entry[0] == chat_id:
@@ -1401,9 +1412,9 @@ class A2AAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=message_id)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        if isinstance(event, A2APeerMessageEvent) and len(event._reply_task_ids) > 1:
+        if isinstance(event, A2APeerMessageEvent):
             with self._pending_lock:
-                self._processing_reply_groups[str(event.message_id)] = tuple(event._reply_task_ids)
+                self._processing_reply_groups[str(event.message_id)] = event._reply_task_ids
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Settle the exact server-owned tasks consumed by this processing turn.
