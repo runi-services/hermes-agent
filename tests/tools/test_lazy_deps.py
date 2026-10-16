@@ -52,6 +52,23 @@ def test_core_fastapi_pin_matches_web_extra():
     assert core["fastapi"].startswith("==")
 
 
+def test_teams_lazy_sdk_family_matches_locked_extra():
+    """A lazy Teams install must not resolve a newer API with a new OTel floor."""
+    from pathlib import Path
+    import tomllib
+    from packaging.requirements import Requirement
+
+    root = Path(__file__).resolve().parents[2]
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+    specs = project["optional-dependencies"]["teams"]
+    family = {Requirement(spec).name: str(Requirement(spec).specifier) for spec in specs}
+    names = {"microsoft-teams-apps", "microsoft-teams-api", "microsoft-teams-cards", "microsoft-teams-common"}
+    assert names <= family.keys()
+    locked = {p["name"]: p["version"] for p in tomllib.loads((root / "uv.lock").read_text())["package"]}
+    assert all(family[name] == "==" + locked[name] for name in names)
+    assert set(ld.LAZY_DEPS["platform.teams"]) == set(specs)
+
+
 class TestSpecSafety:
     @pytest.mark.parametrize("spec", [
         "mistralai>=2.3.0,<3",
