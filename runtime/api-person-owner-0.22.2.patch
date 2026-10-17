@@ -1,0 +1,198 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 8045b00317..bd479cea02 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -2334,6 +2334,41 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+         model = self._recover_or_record_model(model, runtime_kwargs, gateway_session_key)
+         return model, session_override, request_model, request_provider
+
++    async def _chat_user_owner_error(self, session_id: str, user_id: Optional[str]):
++        """Claim a fresh private-body session; never rebind an existing owner.
++
++        Native SessionDB's upsert deliberately never updates user_id. Re-reading
++        after create also detects a competing first writer before any history
++        read or agent/memory initialization. Legacy NULL owners stay NULL.
++        """
++        try:
++            db = await self._ensure_session_db_async()
++            if db is None:
++                if user_id is None:
++                    return None
++                raise RuntimeError("Session database unavailable")
++
++            def check_owner():
++                row = db.get_session(session_id)
++                if row is None:
++                    # Also reserve anonymous sessions: otherwise a simultaneous
++                    # identified request could claim the ID after this check.
++                    db.create_session(session_id, "api_server", user_id=user_id)
++                    row = db.get_session(session_id)
++                    if row is None:
++                        raise RuntimeError("Session owner was not persisted")
++                return row is not None and row.get("user_id") != user_id
++
++            mismatch = await asyncio.to_thread(check_owner)
++        except Exception:
++            logger.warning("Cannot verify chat session owner", exc_info=True)
++            return web.json_response(_openai_error(
++                "Cannot verify session owner", code="session_owner_unavailable"), status=503)
++        if mismatch:
++            return web.json_response(_openai_error(
++                "Session owner mismatch; start a fresh session", code="session_owner_mismatch"), status=409)
++        return None
++
+     def _create_agent(
+         self, ephemeral_system_prompt: Optional[str] = None, session_id: Optional[str] = None,
+         stream_delta_callback=None, tool_progress_callback=None, tool_start_callback=None,
+@@ -2343,7 +2378,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+         model_options: Optional[dict[str, Any]] = None, route: Optional[dict[str, Any]] = None,
+         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
+         room_dispatch: Optional[dict[str, Any]] = None,
+-        room_execution_policy: Optional[dict[str, Any]] = None) -> Any:
++        room_execution_policy: Optional[dict[str, Any]] = None, user_id: Optional[str] = None) -> Any:
+         """Create an AIAgent from the gateway runtime config + platform toolsets.
+         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
+         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
+@@ -2391,7 +2426,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+             "max_iterations": max_iterations, "quiet_mode": True, "verbose_logging": False,
+             "ephemeral_system_prompt": ephemeral_system_prompt or None,
+             "enabled_toolsets": enabled_toolsets, "session_id": session_id,
+-            "platform": "api_server",
++            "platform": "api_server", "user_id": user_id,
+             "stream_delta_callback": stream_delta_callback,
+             "tool_progress_callback": tool_progress_callback,
+             "tool_start_callback": tool_start_callback,
+@@ -4197,7 +4232,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+         session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
+         relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
+         resume_unanswered_turn: bool = False, approval_notify_callback=None,
+-        approval_session_key: Optional[str] = None) -> tuple:
++        approval_session_key: Optional[str] = None, user_id: Optional[str] = None) -> tuple:
+         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
+         ``approval_notify_callback`` (with ``approval_session_key``) routes dangerous-command
+         approval requests to the caller's stream, keyed like ``/v1/runs`` approvals (#51871).
+@@ -4240,7 +4275,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+                         reasoning_callback=reasoning_callback, status_callback=status_callback,
+                         gateway_session_key=gateway_session_key, requested_model=requested_model,
+                         requested_provider=requested_provider, model_options=model_options, route=route,
+-                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
++                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock, user_id=user_id)
+                     if agent_ref is not None:
+                         agent_ref[0] = agent
+                     if resume_unanswered_turn:
+diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
+index 0c3a134381..c91adaefd0 100644
+--- a/gateway/platforms/api_server_openai_routes.py
++++ b/gateway/platforms/api_server_openai_routes.py
+@@ -7,6 +7,7 @@ module (top-level import = cycle), and lazy lookup keeps ``patch("...api_server.
+ """
+
+ import asyncio
++import hmac
+ import json
+ import logging
+ import re
+@@ -648,6 +649,24 @@ class OpenAICompatRoutesMixin:
+             body = await request.json()
+         except Exception:
+             return _error_response("Invalid JSON in request body", 400)
++        if not isinstance(body, dict):
++            return web.json_response(_openai_error("Request body must be an object"), status=400)
++        user_id = None
++        if "user_id" in body:
++            # This is trusted private-broker attribution, NOT proof of login.
++            # Never accept it on a guest/session-auth leg or an unkeyed listener.
++            expected_key = self._expected_api_key()
++            authorization = request.headers.get("Authorization", "")
++            if (not expected_key or not authorization.startswith("Bearer ")
++                    or not hmac.compare_digest(authorization[7:].strip().encode(), expected_key.encode())):
++                return web.json_response(_openai_error(
++                    "user_id requires private API key authentication", code="user_id_requires_private_key"), status=403)
++            user_id = body["user_id"]
++            if (not isinstance(user_id, str) or not user_id or len(user_id) > 256
++                    or user_id != user_id.strip() or not user_id.isprintable()):
++                return web.json_response(_openai_error(
++                    "Invalid user_id", code="invalid_user_id"), status=400)
++
+         from gateway.platforms.api_server import _request_relay_metadata
+         relay_metadata = _request_relay_metadata(body)
+         messages = body.get("messages")
+@@ -699,6 +718,9 @@ class OpenAICompatRoutesMixin:
+             if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
+                 return _invalid_request("Session ID too long")
+             session_id = provided_session_id
++            owner_err = await self._chat_user_owner_error(session_id, user_id)
++            if owner_err is not None:
++                return owner_err
+             try:
+                 db = await self._ensure_session_db_async()
+                 if db is not None:
+@@ -709,7 +731,6 @@ class OpenAICompatRoutesMixin:
+                     # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
+                     from gateway.platforms.api_server_runs import _resolve_live_session_id
+                     session_id = await _resolve_live_session_id(self, provided_session_id)
+-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+             except Exception as e:
+                 logger.warning("Failed to load session history for %s: %s", session_id, e)
+                 history = []
+@@ -718,7 +739,20 @@ class OpenAICompatRoutesMixin:
+             # one Hermes session; namespaced by the routed profile (#123989).
+             first_user = next(
+                 (cm.get("content", "") for cm in conversation_messages if cm.get("role") == "user"), "")
+-            session_id = _derive_chat_session_id(system_prompt, first_user, _api_request_profile.get())
++            identity_seed = (json.dumps([user_id, first_user], ensure_ascii=False)
++                             if user_id is not None else first_user)
++            session_id = _derive_chat_session_id(system_prompt, identity_seed, _api_request_profile.get())
++        owner_err = await self._chat_user_owner_error(session_id, user_id)
++        if owner_err is not None:
++            return owner_err
++        if provided_session_id:
++            try:
++                db = await self._ensure_session_db_async()
++                if db is not None:
++                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
++            except Exception as e:
++                logger.warning("Failed to load session history for %s: %s", session_id, e)
++                history = []
+         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+         model_name = body.get("model", self._model_name)
+         created = int(time.time())
+@@ -731,7 +765,7 @@ class OpenAICompatRoutesMixin:
+             user_message=user_message, conversation_history=history,
+             ephemeral_system_prompt=system_prompt, session_id=session_id,
+             gateway_session_key=gateway_session_key, **agent_overrides, route=route,
+-            relay_metadata=relay_metadata,
++            relay_metadata=relay_metadata, user_id=user_id,
+             # #98619: only an explicitly provided X-Hermes-Session-Id is wake-capable (the
+             # header is 403-gated on API_SERVER_KEY, so the wake self-post can authenticate
+             # and the client can resume the session by sending it again). A fingerprint-derived
+@@ -791,8 +825,8 @@ class OpenAICompatRoutesMixin:
+         outcome, err = await self._run_idempotent(
+             request, body, _compute_completion, log_label="chat completions",
+             fingerprint_keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream",
+-                              "hermes_notification_category"],
+-            route="chat_completions",
++                              "hermes_notification_category", "user_id"],
++            route="chat_completions", identity_scope=(session_id, user_id),
+         )
+         if err is not None:
+             return err
+@@ -842,7 +876,8 @@ class OpenAICompatRoutesMixin:
+
+     async def _run_idempotent(
+         self, request: web.Request, body: dict[str, Any], compute, *,
+-        log_label: str, fingerprint_keys: list[str], route: str) -> tuple:
++        log_label: str, fingerprint_keys: list[str], route: str,
++        identity_scope: Optional[tuple[str, Optional[str]]] = None) -> tuple:
+         """Run ``compute()`` once per (principal scope, logical route, Idempotency-Key) + body fingerprint
+         -> ``((result, usage), None)`` or ``(None, 500 response)``.
+
+@@ -859,6 +894,8 @@ class OpenAICompatRoutesMixin:
+             if idempotency_key:
+                 principal_scope = self._run_idempotency_scope(request)
+                 scoped_key = f"{principal_scope}\0{route}\0{idempotency_key}"
++                if identity_scope is not None:
++                    scoped_key = json.dumps([scoped_key, *identity_scope])
+                 fp = _make_request_fingerprint(body, keys=fingerprint_keys)
+                 result, usage = await _idem_cache.get_or_set(scoped_key, fp, compute)
+             else:
