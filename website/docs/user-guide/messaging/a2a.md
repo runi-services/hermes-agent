@@ -74,7 +74,16 @@ With the platform enabled, Hermes serves:
 - **SSE streaming** for `SendStreamingMessage`, with spec-correct JSON-RPC-enveloped frames.
 - **Push notifications** (webhooks) for long-running tasks, HMAC-SHA256 signed.
 
-Inbound tasks are injected into a **live gateway session** — the same agent, memory, and tools that serve your other channels — and the final reply is returned to the caller as the task result. Conversations are keyed by the A2A `contextId`, so a peer can hold a multi-turn exchange.
+Inbound tasks are injected into a **live gateway session** — the same agent, memory, and tools that serve your other channels — and the final reply is returned to the caller as the task result. By default, conversations are keyed by the A2A `contextId`, so a peer can hold a multi-turn exchange.
+
+For the native live gateway route, `gateway.platforms.a2a.extra.session_scope` accepts:
+
+- `context` (default): retain today's context-keyed conversation routing.
+- `peer`: use one gateway conversation per authenticated sending identity and served agent/tenant, even when that sender starts a new A2A context. Use named per-peer credentials; shared-token or anonymous loopback callers have only an IP identity and therefore share that IP's conversation. Message text and metadata cannot choose the peer.
+
+Wire task IDs, context IDs, audit/journal correlation, anti-loop limits and final replies remain per protocol task/context. Peer scope changes only gateway conversation selection; it does not change busy/queue/stop policy. If the existing queue coalesces same-peer inputs, the resulting answer settles each server-recorded absorbed task on its own context; canceling one task does not cancel its siblings. Replies must name their triggering task so unrelated tasks cannot receive them. Legacy subprocess-forwarded profile routes retain their existing context routing; this option applies to the native live route only.
+
+**Forward-only activation:** changing scope opens new peer-keyed sessions. Peer selection uses a fixed `peer-dm` key namespace, stamped by the adapter through source scope metadata; a caller-chosen legacy context ID cannot alias it. Source chat type remains `dm`, and parser/background-event recovery preserve that scope. Existing context sessions and history remain untouched. There is no automatic migration, rebind, or history merge. Activate at the receiving seat's drained minute, then prove two messages from the same authenticated peer on different contexts reach one new session.
 
 Interoperability is verified against the official Python `a2a-sdk` (card resolution, `SendMessage`, streaming).
 

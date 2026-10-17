@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer = "2026-10-02T19:43:34.468409Z"
 exclude-newer-span = "P14D"
 
 [options.exclude-newer-package]
@@ -1724,6 +1724,7 @@ modal = [
     { name = "modal" },
 ]
 otlp = [
+    { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
 ]
@@ -1743,7 +1744,10 @@ supermemory = [
 ]
 teams = [
     { name = "aiohttp" },
+    { name = "microsoft-teams-api" },
     { name = "microsoft-teams-apps" },
+    { name = "microsoft-teams-cards" },
+    { name = "microsoft-teams-common" },
 ]
 termux = [
     { name = "agent-client-protocol" },
@@ -1839,7 +1843,7 @@ requires-dist = [
     { name = "elevenlabs", marker = "extra == 'tts-premium'", specifier = "==1.59.0" },
     { name = "exa-py", marker = "extra == 'exa'", specifier = "==2.10.2" },
     { name = "fal-client", marker = "extra == 'fal'", specifier = "==0.13.1" },
-    { name = "fastapi", specifier = ">=0.104.0,<1" },
+    { name = "fastapi", specifier = "==0.133.1" },
     { name = "fastapi", marker = "extra == 'web'", specifier = "==0.133.1" },
     { name = "faster-whisper", marker = "extra == 'voice'", specifier = "==1.2.1" },
     { name = "fire", specifier = "==0.7.1" },
@@ -1883,7 +1887,10 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'dev'", specifier = "==2.0.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = "==2.0.0" },
     { name = "mem0ai", marker = "extra == 'mem0'", specifier = "==2.0.10" },
+    { name = "microsoft-teams-api", marker = "extra == 'teams'", specifier = "==2.0.13.4" },
     { name = "microsoft-teams-apps", marker = "extra == 'teams'", specifier = "==2.0.13.4" },
+    { name = "microsoft-teams-cards", marker = "extra == 'teams'", specifier = "==2.0.13.4" },
+    { name = "microsoft-teams-common", marker = "extra == 'teams'", specifier = "==2.0.13.4" },
     { name = "mistralai", marker = "extra == 'mistral'", specifier = "==2.4.8" },
     { name = "modal", marker = "extra == 'modal'", specifier = "==1.3.4" },
     { name = "nemo-relay", marker = "(platform_machine == 'aarch64' and 'android' not in platform_release and sys_platform == 'linux') or (platform_machine == 'x86_64' and 'android' not in platform_release and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'ARM64' and sys_platform == 'win32')", specifier = ">=0.7.1,<0.8" },
@@ -1891,6 +1898,7 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'wake'", specifier = "==2.4.3" },
     { name = "onnxruntime", marker = "extra == 'wake'", specifier = "==1.27.0" },
     { name = "openai", specifier = "==2.24.0" },
+    { name = "opentelemetry-api", marker = "extra == 'otlp'", specifier = "==1.39.1" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otlp'", specifier = "==1.39.1" },
     { name = "opentelemetry-sdk", marker = "extra == 'otlp'", specifier = "==1.39.1" },
     { name = "openwakeword", marker = "extra == 'wake'", specifier = "==0.6.0" },

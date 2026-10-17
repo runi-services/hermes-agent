@@ -124,6 +124,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # monitoring.gateway_health_export / monitoring.export.otlp. Tracks the
     # `otlp` extra in pyproject.toml — bump both together.
     "export.otlp": (
+        "opentelemetry-api==1.39.1",
         "opentelemetry-sdk==1.39.1",
         "opentelemetry-exporter-otlp-proto-http==1.39.1",
     ),
@@ -250,7 +251,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),  # aiohttp 3.14.3: prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
+    # Keep the transitive SDK siblings at the lockfile's supported release.
+    # API 2.1 otherwise raises the OTel API behind the optional older SDK.
+    "platform.teams": (
+        "microsoft-teams-apps==2.0.13.4",
+        "microsoft-teams-api==2.0.13.4",
+        "microsoft-teams-cards==2.0.13.4",
+        "microsoft-teams-common==2.0.13.4",
+        "aiohttp==3.14.3",  # prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
+    ),
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),

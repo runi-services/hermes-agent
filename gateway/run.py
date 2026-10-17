@@ -3878,7 +3878,10 @@ def _parse_session_key(session_key: str) -> "dict | None":
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
-        if len(parts) > 5 and parts[3] in {"dm", "thread"}:
+        if parts[2:4] == ["a2a", "peer-dm"]:
+            result["chat_type"] = "dm"
+            result["scope_id"] = "peer"
+        if len(parts) > 5 and result["chat_type"] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
         return result
     return None
@@ -10169,6 +10172,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    def _fold_into_running_turn(self, running_agent, session_key: str, event: MessageEvent):
+        """Retain reply owners only when this agent still owns the running turn.
+
+        Older MessageEvent types have no absorption hook; leave their policy
+        unchanged. Native peer events use it to retain accepted injected tasks.
+        """
+        state = self._peek_session_state(session_key)
+        if state is None or state.turn.agent is not running_agent:
+            return None
+        current_event = getattr(state.turn, "event", None)
+        absorb = getattr(current_event, "absorb_reply_expected", None)
+        if current_event is not event and callable(absorb):
+            absorb(event)
+        return state.turn
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -10408,6 +10426,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                 redirected = False
+
+        if steered or redirected:
+            self._fold_into_running_turn(running_agent, session_key, event)
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).  Skip this for a
@@ -16620,6 +16641,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Steer failed for session %s: %s", quick_key, exc)
                 return f"⚠️ Steer failed: {exc}"
             if accepted:
+                self._fold_into_running_turn(running_agent, quick_key, event)
                 preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                 return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
             return "Steer rejected (empty payload)."
@@ -17352,6 +17374,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("PRIORITY steer failed for session %s: %s", _quick_key, exc)
                         steered = False
                 if steered:
+                    self._fold_into_running_turn(running_agent, _quick_key, event)
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
@@ -17402,6 +17425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 try:
                     if running_agent.redirect((event.text or "").strip()):
+                        self._fold_into_running_turn(running_agent, _quick_key, event)
                         logger.debug("PRIORITY redirect for session %s", _quick_key)
                         return None
                 except Exception as exc:
@@ -18194,6 +18218,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+        _claim_state.turn.event = event
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
@@ -25137,6 +25162,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+        derived_scope_id = ""
 
         if session_key:
             try:
@@ -25160,6 +25186,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                derived_scope_id = _parsed.get("scope_id", "")
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
@@ -25193,7 +25220,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
-        scope_id = str(evt.get("scope_id") or "").strip() or None
+        scope_id = str(evt.get("scope_id") or derived_scope_id or "").strip() or None
         if scope_id is None and chat_type not in ("dm", "thread"):
             # Reconstructed (non-persisted) source for a scoped chat with no
             # scope discriminator: on a relay-fronted deployment the

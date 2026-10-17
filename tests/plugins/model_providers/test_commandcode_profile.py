@@ -270,7 +270,9 @@ class TestCommandCodeFetchModelsPickerContract:
         chat = resolve_provider_full("commandcode", {}, [])
         assert chat is not None and chat.id == "commandcode"
         assert chat.transport == "openai_chat"
-        assert "COMMANDCODE_API_KEY" in chat.api_key_env_vars
+        # The models.dev registry is authoritative for a registered provider;
+        # its Provider API key name is CMD_API_KEY (the plugin alias is legacy).
+        assert "CMD_API_KEY" in chat.api_key_env_vars
 
         anth = resolve_provider_full("commandcode-anthropic", {}, [])
         assert anth is not None and anth.id == "commandcode-anthropic"
