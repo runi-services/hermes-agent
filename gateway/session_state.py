@@ -73,6 +73,8 @@ class TurnState:
     # preserves that: release/rebind only match when generation is current.
     lease_token: Any = None
     lease_generation: Optional[int] = None
+    # Native event holding the reply owners of this running turn.
+    event: Any = None
 
     def clear(self) -> None:
         """Reset the per-turn slot (agent / start ts / lease / busy-ack).
@@ -82,6 +84,7 @@ class TurnState:
         by the caller so it can call ``lease.release()``), _busy_ack_ts.
         """
         self.agent = None
+        self.event = None
         self.started_ts = 0.0
         self.lease = None
         self.busy_ack_ts = 0.0
