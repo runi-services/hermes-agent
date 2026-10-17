@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import pytest
 
 from plugins.platforms.a2a import protocol, tools
 
@@ -61,11 +62,9 @@ def test_auth_header_absent_when_token_file_is_group_readable(tmp_path):
     token_path.write_text("fixture-peer-token-16b\n", encoding="utf-8")
     os.chmod(token_path, stat.S_IRUSR | stat.S_IRGRP)
 
-    headers = tools._auth_header(
-        {"type": "bearer", "token_file": str(token_path)}
-    )
-
-    assert headers.get("Authorization") is None
+    # Reject instead of silently sending anonymously; this is a stronger boundary.
+    with pytest.raises(ValueError, match="Configured A2A bearer file"):
+        tools._auth_header({"type": "bearer", "token_file": str(token_path)})
 
 
 def test_named_peer_token_file_hydrates_authorization(tmp_path, monkeypatch):

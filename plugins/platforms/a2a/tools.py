@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import stat
 import urllib.error
 import urllib.request
@@ -53,35 +54,41 @@ def _load_config() -> dict:
 
 
 def _hydrate_auth(auth: dict) -> dict:
-    """Fill ``token`` from ``token_file``. ``_auth_header`` is anonymous without ``token``."""
+    """Read explicit file custody first; invalid custody never falls back inline."""
     out = dict(auth or {})
-    if out.get("token"):
-        if not out.get("type"):
+    if not out.get("token_file"):
+        if out.get("token") and not out.get("type"):
             out["type"] = "bearer"
         return out
-    path = str(out.get("token_file") or "").strip()
-    if not path:
-        return out
-    p = Path(path).expanduser()
     try:
-        if p.is_symlink() or not p.is_file():
-            return out
-        mode = p.stat().st_mode
-        if mode & (stat.S_IRWXG | stat.S_IRWXO):
-            return out
-        token = p.read_text(encoding="utf-8").strip()
-    except OSError:
-        return out
-    if token and all(not ch.isspace() for ch in token) and 8 <= len(token) <= 4096:
-        out["token"] = token
-        out["type"] = out.get("type") or "bearer"
+        path = os.path.expanduser(out["token_file"])
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        getuid = getattr(os, "getuid", None)
+        if nofollow is None or getuid is None:
+            raise ValueError
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != getuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
+                raise ValueError
+            raw = handle.read(4099)
+        token = raw.decode("ascii").strip()
+        if len(raw) > 4098 or not 8 <= len(token) <= 4096 or any(c.isspace() or ord(c) < 33 or ord(c) > 126 for c in token):
+            raise ValueError
+    except (OSError, ValueError, TypeError):
+        raise ValueError("Configured A2A bearer file is unreadable, insecure, or invalid") from None
+    out["token"] = token
+    out["type"] = out.get("type") or "bearer"
     return out
 
 
 def _peer_from_entry(entry: dict, *, url: str | None = None) -> dict:
     return {
         "url": url if url is not None else entry.get("url", ""),
-        "auth": _hydrate_auth(entry.get("auth", {}) or {}),
+        "auth": dict(entry.get("auth", {}) or {}),
+        "pin_url": entry.get("pin_url") is True,
         "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
         "capabilities": entry.get("capabilities", []) or [],
         "tenant": entry.get("tenant", ""),
@@ -97,6 +104,8 @@ def _resolve_peer(agent: str) -> Optional[dict]:
     cfg = _load_config()
     peers = cfg.get("a2a_agents") or {}
     if agent.startswith("http://") or agent.startswith("https://"):
+        if "outbound_allowlist" in (cfg.get("a2a") or {}):
+            return None
         want = agent.rstrip("/")
         for entry in peers.values():
             if not isinstance(entry, dict):
@@ -107,6 +116,9 @@ def _resolve_peer(agent: str) -> Optional[dict]:
         return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
     entry = peers.get(agent)
     if not entry:
+        return None
+    allowed = (cfg.get("a2a") or {}).get("outbound_allowlist")
+    if allowed is not None and (not isinstance(allowed, list) or agent not in allowed):
         return None
     return _peer_from_entry(entry)
 
@@ -122,9 +134,15 @@ def _auth_header(auth: dict) -> dict:
 # HTTP
 # --------------------------------------------------------------------------
 
+class _NoA2ARedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        fp.close()
+        raise ValueError("A2A redirect refused; configured destination is authoritative")
+
+
 def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
     req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+    with urllib.request.build_opener(_NoA2ARedirect()).open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -132,7 +150,7 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     data = json.dumps(body).encode("utf-8")
     hdrs = {"Content-Type": "application/json", "A2A-Version": protocol.PROTOCOL_VERSION, **headers}
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+    with urllib.request.build_opener(_NoA2ARedirect()).open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -196,16 +214,26 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     Raises urllib errors / ValueError for the caller to format. Handles
     outbound redaction, audit, persistence, and metrics.
     """
+    cfg = _load_config()
+    allowed = (cfg.get("a2a") or {}).get("outbound_allowlist")
+    if allowed is not None:
+        configured = (cfg.get("a2a_agents") or {}).get(agent_label)
+        if (not isinstance(allowed, list) or agent_label not in allowed
+                or not isinstance(configured, dict) or configured.get("pin_url") is not True
+                or peer.get("url") != configured.get("url")):
+            raise ValueError("Error: A2A destination is outside the configured peer scope")
+        peer = _peer_from_entry(configured)
     base_url = peer.get("url", "")
     headers = _auth_header(peer.get("auth", {}) or {})
     timeout = int(peer.get("timeout", _DEFAULT_TIMEOUT))
 
     # Best-effort card fetch (to learn the rpc URL); non-fatal on failure.
     card = None
-    try:
-        card = _fetch_card(base_url, headers, min(timeout, 30))
-    except Exception:
-        pass
+    if not peer.get("pin_url"):
+        try:
+            card = _fetch_card(base_url, headers, min(timeout, 30))
+        except Exception:
+            pass
 
     ctx = context_id or protocol.new_context_id()
     safe_message = security.redact_outbound(message)
@@ -227,7 +255,7 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 
-    resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
+    resp = _http_post_json(base_url if peer.get("pin_url") else _rpc_url(base_url, card), rpc_body, headers, timeout)
     if "error" in resp:
         err = resp["error"]
         raise ValueError(f"Peer '{agent_label}' returned an error: {err.get('message', err)}")
@@ -270,6 +298,9 @@ def a2a_discover(args: dict, **_: Any) -> str:
     url = str(args.get("url") or "").strip()
     if not url:
         return "Error: 'url' is required (e.g. http://localhost:9999)."
+    cfg = _load_config()
+    if "outbound_allowlist" in (cfg.get("a2a") or {}):
+        return "Error: discovery is disabled for restricted peers; use the configured peer name."
     try:
         card = _fetch_card(url, {}, _DEFAULT_TIMEOUT)
     except urllib.error.HTTPError as e:
@@ -426,11 +457,7 @@ def _match_peers_by_capability(capability: str) -> list[tuple[str, dict]]:
 def _call_peer_sync(agent_name: str, peer_entry: dict, message: str, context_id: str = "") -> tuple[str, str]:
     """Call a single peer synchronously. Returns (agent_name, reply_text)."""
     try:
-        peer = {
-            "url": peer_entry.get("url", ""),
-            "auth": peer_entry.get("auth", {}) or {},
-            "timeout": int(peer_entry.get("timeout", _DEFAULT_TIMEOUT)),
-        }
+        peer = _peer_from_entry(peer_entry)
         reply, _ctx, _state = _send_task(agent_name, peer, message, context_id)
         return (agent_name, reply or "(no reply)")
     except Exception as e:
