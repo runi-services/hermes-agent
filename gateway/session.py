@@ -715,6 +715,10 @@ def build_session_key(
     # Duck-typed sources may lack user_id_alt: read the participant only when it matters.
     participant_id = _canonical_participant(source) if (isolate_user or not is_dm) else None
 
+    # Peer-scoped A2A uses a fixed key slot disjoint from legacy DM context
+    # ids; the source remains a DM so chat/queue policy does not change.
+    if is_dm and source.platform.value == "a2a" and source.scope_id == "peer":
+        chat_type_slot = "peer-dm"
     parts = [_session_key_namespace(profile), source.platform.value, chat_type_slot]
     if source.platform == Platform.SLACK and source.scope_id:
         parts.append(str(source.scope_id))

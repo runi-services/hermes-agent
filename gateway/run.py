@@ -2974,7 +2974,10 @@ def _parse_session_key(session_key: str) -> dict | None:
         result = {"platform": parts[2], "chat_type": parts[3], "chat_id": parts[4]}
         if parts[1] != "main":
             result["profile"] = profile_from_session_key_namespace(parts[1])
-        if len(parts) > 5 and parts[3] in {"dm", "thread"}:
+        if parts[2:4] == ["a2a", "peer-dm"]:
+            result["chat_type"] = "dm"
+            result["scope_id"] = "peer"
+        if len(parts) > 5 and result["chat_type"] in {"dm", "thread"}:
             result["thread_id"] = parts[5]
         return result
     return None

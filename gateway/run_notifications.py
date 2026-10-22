@@ -693,7 +693,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         def _opt(field: str) -> Optional[str]:
             return str(evt.get(field) or "").strip() or None
 
-        scope_id = _opt("scope_id")
+        scope_id = _opt("scope_id") or derived.get("scope_id")
         if scope_id is None and chat_type not in ("dm", "thread"):
             # Reconstructed scoped-chat source without scope_id: a relay connector's tenant guard may
             # decline the reply. Warn, don't fail (native adapters need no scope_id).

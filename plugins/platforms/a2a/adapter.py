@@ -18,6 +18,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import OrderedDict, deque
+from dataclasses import dataclass, field
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -258,12 +259,38 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent))
 
 
+@dataclass
+class A2APeerMessageEvent(MessageEvent):
+    """Server-owned reply owners for a peer turn that absorbs queued tasks."""
+
+    _reply_task_ids: list[str] = field(default_factory=list, repr=False)
+
+    def __post_init__(self):
+        if not self._reply_task_ids and self.message_id:
+            self._reply_task_ids = [str(self.message_id)]
+
+    def absorb_reply_expected(self, other):
+        parent_absorb = getattr(super(), "absorb_reply_expected", None)
+        if parent_absorb is not None:
+            parent_absorb(other)
+        if isinstance(other, A2APeerMessageEvent):
+            # These events are minted only after native authentication. A queue
+            # merge must not transfer ownership across peer/session boundaries.
+            own = (self.source.user_id, self.source.chat_id, self.source.scope_id)
+            theirs = (other.source.user_id, other.source.chat_id, other.source.scope_id)
+            if own == theirs:
+                self._reply_task_ids.extend(owner for owner in other._reply_task_ids if owner not in self._reply_task_ids)
+
+
 class A2AAdapter(BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("a2a"))
         extra = getattr(config, "extra", {}) or {}
+        self.session_scope = extra.get("session_scope", "context")
+        if self.session_scope not in ("context", "peer"):
+            raise ValueError("A2A session_scope must be 'context' or 'peer'")
         # Scope-aware: a secondary multiplex profile must not borrow the default profile's bridged
         # A2A_PORT (falls closed to the module default). advertised_toolsets is deliberately unscoped.
         # (advertised_toolsets has the same env-leak shape but is left unscoped here — see the "Scope note"
@@ -297,6 +324,7 @@ class A2AAdapter(BasePlatformAdapter):
         # Admission ids this process already forwarded; a resend of one is a retry, not a new turn.
         self._forwarded_inputs: OrderedDict[str, None] = OrderedDict()
         self._pending_lock = threading.Lock()
+        self._processing_reply_groups: dict[str, list[str]] = {}
 
     @property
     def name(self) -> str:
@@ -525,9 +553,27 @@ class A2AAdapter(BasePlatformAdapter):
         entry[1].set_result((state, text))
         return True
 
+    def _reply_owners_for_task(self, task_id: str) -> tuple[str, ...]:
+        """Exact server-owned turn membership, including inputs injected mid-run.
+
+        Callers hold _pending_lock. A running event retains its mutable owner
+        list so an accepted steer/redirect can extend it after processing starts.
+        """
+        for anchor, owners in getattr(self, "_processing_reply_groups", {}).items():
+            if task_id == anchor or task_id in owners:
+                return tuple(owners)
+        return (task_id,)
+
     def _resolve_task(self, task_id: str, state: str, text: str) -> bool:
         with self._pending_lock:
-            return self._resolve_locked(task_id, state, text)
+            # A normal final answers every input actually absorbed by this
+            # processing turn. Protocol cancellation remains exact-task only.
+            owners = (self._reply_owners_for_task(task_id)
+                      if state == protocol.STATE_COMPLETED else (task_id,))
+            landed = False
+            for owner in owners:
+                landed = self._resolve_locked(owner, state, text) or landed
+            return landed
 
     def _resolve_oldest_for_context(self, context_id: str, state: str, text: str) -> bool:
         with self._pending_lock:
@@ -541,6 +587,18 @@ class A2AAdapter(BasePlatformAdapter):
         self.tasks.complete(rec["task_id"], state, stored_reply)
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
+
+    def _session_chat_id(self, peer: str, context_id: str, agent: dict) -> str:
+        """Select a gateway conversation without changing the protocol context.
+
+        The peer is supplied by HTTP authentication, never message metadata.
+        Use an unambiguous encoding so tenant/agent/peer names cannot collide.
+        """
+        if self.session_scope == "context":
+            return context_id
+        identity = [self._active_profile, *self._scope_for_agent(agent), peer]
+        digest = hashlib.sha256(json.dumps(identity, ensure_ascii=True).encode("utf-8")).hexdigest()
+        return f"peer-{digest}"
 
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
@@ -592,9 +650,12 @@ class A2AAdapter(BasePlatformAdapter):
                 self._pop_pending(task_id)
         if self._loop is None or self._message_handler is None:
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
-        fut = self._add_pending(task_id, context_id)
-        event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
-                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+        chat_id = self._session_chat_id(peer, context_id, agent)
+        fut = self._add_pending(task_id, chat_id)
+        event_type = A2APeerMessageEvent if self.session_scope == "peer" else MessageEvent
+        event = event_type(text=framed, message_type=MessageType.TEXT, message_id=task_id,
+                             source=self.build_source(chat_id=chat_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer,
+                                                      scope_id="peer" if self.session_scope == "peer" else None))
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception as e:
@@ -848,14 +909,28 @@ class A2AAdapter(BasePlatformAdapter):
         logger.debug("A2A: push notification sent for task %s", task_id)
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None):
-        """Fulfil the oldest pending reply Future for this context (``chat_id`` = A2A context id).
-        Only sends carrying ``metadata['notify']`` (the base adapter's final-reply marker) satisfy
-        the caller; progress/status/preview sends must not."""
+        """Settle the triggering task, not another waiter sharing its session.
+
+        Peer-scoped chats can contain several protocol contexts. A final reply
+        therefore requires the gateway's immutable triggering message id. Keep
+        the legacy context FIFO only for unbound context-scoped sends.
+        """
+        message_id = str(int(time.time() * 1000))
         if not (metadata or {}).get("notify"):
-            logger.debug("A2A: ignoring non-final send for context %s", chat_id)
-        elif not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
-            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)  # late chunk / out-of-band
-        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+            return SendResult(success=True, message_id=message_id)
+        task_id = reply_to or (metadata or {}).get("reply_to_message_id")
+        if task_id:
+            with self._pending_lock:
+                owners = self._reply_owners_for_task(str(task_id))
+                for owner in owners:
+                    entry = self._pending.get(owner)
+                    if entry and entry[0] == chat_id:
+                        self._resolve_locked(owner, protocol.STATE_COMPLETED, content or "")
+        elif self.session_scope == "context":
+            self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or "")
+        else:
+            logger.debug("A2A: ignoring unbound final send for peer chat %s", chat_id)
+        return SendResult(success=True, message_id=message_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None
@@ -863,20 +938,46 @@ class A2AAdapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {"name": f"a2a:{chat_id}", "type": "dm"}
 
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        if isinstance(event, A2APeerMessageEvent):
+            with self._pending_lock:
+                self._processing_reply_groups[str(event.message_id)] = event._reply_task_ids
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Resolve the task future when processing ends without a reply send (failures,
-        cancellations, empty runs, or a reply the gateway already streamed to the user) so the
-        HTTP thread returns promptly."""
+        """Settle the exact server-owned tasks consumed by this processing turn.
+
+        Keep the group until processing completes, not until an HTTP observer
+        leaves: a timed-out/cancelled primary must not strand its siblings.
+        This also composes with the installed task-lifetime send override.
+        """
         task_id = str(getattr(event, "message_id", "") or "")
-        if task_id:
-            # A streamed turn never calls send() with notify=True (the gateway suppresses the
-            # normal final send once streaming delivered the body), so the SUCCESS default must
-            # not resolve with "" — that strands every A2A streaming reply as an empty completed
-            # task (#116944). _streamed_final_response is the same stash _final_text_for_post_turn_hooks
-            # reads for /goal and /loop.
-            _streamed = getattr(event, "_streamed_final_response", "")
-            default = (protocol.STATE_COMPLETED, _streamed if isinstance(_streamed, str) else "")
-            self._resolve_task(task_id, *{
-                ProcessingOutcome.FAILURE: (protocol.STATE_FAILED, "[agent processing failed]"),
-                ProcessingOutcome.CANCELLED: (protocol.STATE_CANCELED, ""),
-            }.get(outcome, default))
+        owners = (event._reply_task_ids if isinstance(event, A2APeerMessageEvent) else [task_id])
+        streamed = getattr(event, "_streamed_final_response", "")
+        result = (protocol.STATE_COMPLETED, streamed if isinstance(streamed, str) else "")
+        if outcome == ProcessingOutcome.FAILURE:
+            result = (protocol.STATE_FAILED, "[agent processing failed]")
+        elif outcome == ProcessingOutcome.CANCELLED:
+            result = (protocol.STATE_CANCELED, "")
+        else:
+            # send() normally resolved the final already. A plugin may have
+            # resolved a different absorbed owner, or its HTTP thread may have
+            # finalized it; read either retained Future or native task result.
+            for owner in owners:
+                with self._pending_lock:
+                    entry = self._pending.get(owner)
+                if entry and entry[1].done() and not entry[1].cancelled():
+                    candidate = entry[1].result()
+                    if candidate[0] == protocol.STATE_COMPLETED:
+                        result = candidate
+                        break
+                record = self.tasks.get(owner)
+                if record and record["state"] == protocol.STATE_COMPLETED:
+                    result = (protocol.STATE_COMPLETED, record.get("reply") or "")
+                    break
+        try:
+            for owner in owners:
+                if owner:
+                    self._resolve_task(owner, *result)
+        finally:
+            with self._pending_lock:
+                getattr(self, "_processing_reply_groups", {}).pop(task_id, None)
