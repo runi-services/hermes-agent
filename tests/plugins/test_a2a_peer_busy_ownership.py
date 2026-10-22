@@ -134,7 +134,7 @@ def test_native_message_claim_binds_injected_owners_and_releases_event(mode, pat
     runner._persist_active_agents = lambda: None
     runner._run_post_turn_hooks = AsyncMock()
     runner._set_session_env = lambda context: None
-    runner._read_user_config = lambda: {}
+    runner._read_user_config = dict
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "synthetic"})
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
     incoming = A2APeerMessageEvent(text="accepted follow-up", message_id="task-follow", source=event.source)

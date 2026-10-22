@@ -244,15 +244,10 @@ def _get_process_hermes_home() -> Path:
     return get_process_hermes_home()
 
 
-def _canonical_hermes_home(path: Path | str) -> Path:
-    """Stable absolute HERMES_HOME path for persisted identity data."""
-    return Path(path).expanduser().resolve(strict=False)
+from gateway.status_control_identity import canonical_hermes_home as _canonical_hermes_home
+from gateway.status_control_identity import bind_status_identity
 
-
-def _same_hermes_home(left: Path | str, right: Path | str) -> bool:
-    """Compare HERMES_HOME paths with the host platform's case semantics."""
-    left_c = os.path.normcase(str(_canonical_hermes_home(left)))
-    return left_c == os.path.normcase(str(_canonical_hermes_home(right)))
+_same_hermes_home, _record_matches_control_identity = bind_status_identity(sys.modules[__name__])
 
 
 def recorded_gateway_home_conflicts(
@@ -751,36 +746,6 @@ def _host_gateway_serves_home(pid: int, profile_home: Path) -> bool:
     except Exception:
         return False
     return owner is not None and owner.pid == pid and owner.serves(profile_name_for_home(profile_home))
-
-
-def _record_matches_control_identity(
-    record: dict[str, Any], pid: int, expected_home: Optional[Path]
-) -> bool:
-    """An argv-opaque runtime needs a live, home- and incarnation-bound socket attestation."""
-    if not _record_looks_like_gateway(record):
-        return False
-    expected_home = expected_home if expected_home is not None else _get_process_hermes_home()
-    start = record.get("start_time")
-    if record.get("pid") != pid or start is None or _get_process_start_time(pid) != start:
-        return False
-    record_home = record.get("hermes_home")
-    if not isinstance(record_home, str) or not record_home.strip() or not Path(record_home).is_absolute():
-        return False
-    try:
-        home = _canonical_hermes_home(expected_home)
-        if _canonical_hermes_home(Path(record_home)) != home:
-            return False
-        from gateway.control_socket import identify_gateway
-        live = identify_gateway(home, timeout=0.5)
-        live_home = live.get("hermes_home") if isinstance(live, dict) else None
-        return bool(
-            live and live.get("protocol") == 1 and live.get("kind") == _GATEWAY_KIND
-            and live.get("pid") == pid and live.get("start_time") == start
-            and isinstance(live_home, str) and live_home.strip() and Path(live_home).is_absolute()
-            and _canonical_hermes_home(Path(live_home)) == home
-        )
-    except (OSError, TypeError, ValueError, ImportError):
-        return False
 
 
 def _record_matches_live_gateway_pid(
