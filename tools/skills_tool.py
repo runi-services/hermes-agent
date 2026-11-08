@@ -257,6 +257,8 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
                                         if ln and not ln.startswith("#")), description)
                 scanned.append({
                     "name": frontmatter.get("name", skill_md.parent.name)[:MAX_NAME_LENGTH],
+                    "version": (str(frontmatter["version"])[:128]
+                                if isinstance(frontmatter.get("version"), (str, int, float)) else None),
                     "description": _truncate_description(description),
                     "category": _get_category_from_path(skill_md), "tier": tier, "root": scan_dir,
                     "path": skill_md, "visible": bool(skill_matches_platform(frontmatter)
@@ -274,11 +276,14 @@ def _skill_catalog(*, skip_disabled: bool = False, include_hidden: bool = False)
     return [dict(s) for s in skills]
 
 
-def find_all_skills(*, skip_disabled: bool = False) -> list[dict[str, Any]]:
+def find_all_skills(*, skip_disabled: bool = False, include_versions: bool = False) -> list[dict[str, Any]]:
     """Loadable skills (name, description, category): ``name`` is what skill_view() accepts —
     the declared name, or the exact relative path for a same-tier duplicate. Shadowed and
-    unloadable copies are left out. ``skip_disabled=True`` ignores disabled state (config UI)."""
-    return [{"name": s["load_name"], "description": s["description"], "category": s["category"]}
+    unloadable copies are left out. ``skip_disabled=True`` ignores disabled state (config UI).
+    ``include_versions`` adds the resolved file's declared version (null when absent), not a
+    claim about a continuing session's cached prompt. The default compact index stays unchanged."""
+    return [{"name": s["load_name"], "description": s["description"], "category": s["category"],
+             **({"version": s.get("version")} if include_versions else {})}
             for s in _skill_catalog(skip_disabled=skip_disabled) if s["load_name"]]
 
 

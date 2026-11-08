@@ -2380,12 +2380,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_require_auth
     async def _handle_skills(self, request: web.Request) -> web.Response:
         """GET /v1/skills — deterministic JSON listing of installed skills (name, description,
-        category), the same set ``/skills list`` shows."""
+        category, declared version), the same resolved set ``/skills list`` shows. Versions
+        describe installed files, not the cached prompts of existing sessions."""
         try:
             from tools.skills_tool import find_all_skills, sort_skills
             skills = sort_skills(
                 find_all_skills(
-                    skip_disabled=False, include_editorial=True
+                    skip_disabled=False, include_versions=True
                 )
             )
         except Exception:
