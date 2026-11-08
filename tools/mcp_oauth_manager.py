@@ -94,8 +94,12 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
             try:
                 await self._prefetch_oauth_metadata()
             except Exception as exc:  # pragma: no cover — the SDK's 401-branch discovery runs next request
+                if self._hermes_authorization_server:
+                    self._initialized = False
+                    raise  # Never guess a token endpoint under an explicit authority pin.
                 self._log_nonfatal("pre-flight metadata discovery", exc)
             else:
+                self._require_authority_metadata()
                 from tools.mcp_oauth_provider import enforce_refresh_token_issuer
                 enforce_refresh_token_issuer(self.context)  # metadata (issuer) only just became known
 
@@ -126,9 +130,11 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                 resp = await _send(client, url, "PRM")
                 prm = await handle_protected_resource_response(resp) if resp is not None else None
                 if prm:
+                    await self._validate_resource_match(prm)
                     self.context.protected_resource_metadata = prm
                     if prm.authorization_servers:
-                        self.context.auth_server_url = str(prm.authorization_servers[0])
+                        self.context.auth_server_url = self._select_authorization_server(
+                            [str(server) for server in prm.authorization_servers])
                     break
             # ASM discovery against auth_server_url (server_url fallback for legacy providers).
             for url in build_oauth_authorization_server_metadata_discovery_urls(self.context.auth_server_url, server_url):
@@ -139,6 +145,9 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
                 if not ok:
                     break
                 if asm:
+                    if self._hermes_authorization_server:
+                        from mcp.client.auth.utils import validate_metadata_issuer
+                        validate_metadata_issuer(asm, self._hermes_authorization_server)
                     self.context.oauth_metadata = asm
                     storage = self._hermes_storage()  # persist now so a later cold-load skips discovery
                     if storage is not None:
@@ -319,13 +328,18 @@ class MCPOAuthManager:
         self._inflight_tasks: set[asyncio.Task] = set()
 
     def get_or_build_provider(self, server_name: str, server_url: str, oauth_config: Optional[dict]) -> Optional[Any]:
-        """Cached OAuth provider for ``server_name``, built on first use (rebuilt when ``server_url`` changes);
+        """Cached OAuth provider, rebuilt when the resource URL or explicit authority changes;
         None if the MCP SDK's OAuth support is unavailable."""
+        from tools.mcp_oauth_provider import authorization_server_override
+        authority = authorization_server_override((oauth_config or {}).get("authorization_server"))
         key = self._key(server_name)
         with self._entries_lock:
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
                 logger.info("MCP OAuth '%s': URL changed from %s to %s, discarding cache", server_name, entry.server_url, server_url)
+                entry = None
+            if (entry is not None and entry.provider is not None
+                    and getattr(entry.provider, "_hermes_authorization_server", None) != authority):
                 entry = None
             if entry is None:
                 entry = self._entries[key] = _ProviderEntry(server_url=server_url, oauth_config=oauth_config)

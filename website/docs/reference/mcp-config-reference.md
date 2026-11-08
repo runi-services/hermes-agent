@@ -351,6 +351,42 @@ Behavior:
 - Only applies to HTTP/StreamableHTTP transport (`url`-based servers)
 - Under a [multiplexed gateway](../user-guide/multi-profile-gateways.md), an OAuth connection is never shared across profiles: each profile authenticates with its own token and opens its own connection, even when the `mcp_servers` entries are identical
 
+### Explicit authorization-server selection
+
+Set `oauth.authorization_server` to select a specific authorization server instead of
+the one advertised by the resource's protected-resource metadata. This is an operator
+trust decision, not an expected-issuer alias or a validation bypass. The value must be
+an absolute HTTPS URL without userinfo, query, fragment or whitespace; omitted or null
+keeps normal discovery. It applies to browser login, device login and runtime refresh.
+
+For example, Entra's `/organizations/v2.0` discovery document returns a literal
+`{tenantid}` issuer, which fails exact issuer validation. Select your tenant's actual
+authority so discovery returns that tenant's concrete issuer instead:
+
+```yaml
+mcp_servers:
+  tenant_api:
+    url: "https://mcp.example.com/mcp"
+    auth: oauth
+    oauth:
+      authorization_server: "https://login.microsoftonline.com/<tenant-id>/v2.0"
+      client_id: "<registered-public-client-id>"
+      flow: device  # optional; the client and authority must support device authorization
+```
+
+Replace the placeholders with your registered application's tenant and client IDs.
+Issuer metadata and browser redirect `iss` validation remain enabled: another tenant,
+the template issuer, or a different issuer is rejected. No issuer is rewritten, no
+tenant is inferred from a token, and a failed pin does not fall back to another
+advertised server. Resource identity, scopes and client/refresh-token issuer bindings
+still apply; this setting grants no permissions and does not change `oauth.scope`.
+
+When adding or changing a pin, run `hermes mcp login <server>` again. Grants stored
+under another issuer (or without an issuer binding) are refused before use, including
+unexpired access tokens. Cached metadata for another issuer is rediscovered, never
+used for refresh; unavailable pinned metadata fails closed rather than guessing a token
+endpoint. Reload the MCP configuration in the consuming session afterward.
+
 ### Device-code login (RFC 8628)
 
 For an authorization server advertising `device_authorization_endpoint`, explicitly choose

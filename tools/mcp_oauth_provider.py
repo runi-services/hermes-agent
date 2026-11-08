@@ -72,6 +72,26 @@ def _with_discovery_context(exc: Exception, failures: list[str]):
 class _RefreshCompletedByPeer(Exception):
     """Restart the SDK auth flow: a peer rotated the grant we were about to present."""
 
+
+def authorization_server_override(value: Any) -> str | None:
+    """Validate an operator-selected issuer without repairing or interpolating it."""
+    if value is None:
+        return None
+    error = "oauth.authorization_server must be an absolute HTTPS URL without userinfo, query or fragment"
+    if (not isinstance(value, str) or not value or any(ord(c) <= 32 or ord(c) == 127 for c in value)
+            or any(c in value for c in "\\?#")):
+        raise ValueError(error)
+    try:
+        parts = urlsplit(value)
+        valid = (parts.scheme == "https" and parts.hostname and parts.username is None
+                 and parts.password is None and parts.port != 0)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(error)
+    return value
+
+
 class HermesProviderMixin:
     """Token-endpoint fixes layered over the SDK's ``OAuthClientProvider`` (must precede it in
     the MRO; subclasses set ``_hermes_logger`` to keep their own logger name).
@@ -86,15 +106,49 @@ class HermesProviderMixin:
     - Any 2xx token/refresh response is accepted; token bodies never leak into errors/logs."""
 
     _hermes_logger: logging.Logger = logger
+    _hermes_authorization_server: str | None = None
 
-    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser", **kwargs: Any):
+    def __init__(self, *args: Any, token_user_agent: str | None = None, oauth_flow: str = "browser",
+                 oauth_authorization_server: str | None = None, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self._hermes_oauth_flow = oauth_flow
+        self._hermes_authorization_server = authorization_server_override(oauth_authorization_server)
+        if self._hermes_authorization_server:
+            self.context.auth_server_url = self._hermes_authorization_server
         # oauth.user_agent — stamped onto token-endpoint requests only; some authorization servers/WAFs
         # reject httpx's default (#75576).
         self._hermes_token_user_agent = token_user_agent
 
+    def _select_authorization_server(self, advertised: list[str]) -> str:
+        """An operator-pinned AS replaces discovery selection, not issuer validation."""
+        return self._hermes_authorization_server or super()._select_authorization_server(advertised)
+
+    def _enforce_authorization_server(self) -> None:
+        """Never reuse an old/unbound grant or another issuer's cached endpoints under a pin."""
+        authority = self._hermes_authorization_server
+        if authority is None:
+            return
+        from mcp.client.auth.exceptions import OAuthFlowError
+        from mcp.client.auth.utils import issuers_match
+        context = self.context
+        stored = getattr(context.storage, "loaded_issuer", None)
+        # Hermes token bindings historically omit trailing slashes; metadata retains its exact issuer.
+        if context.current_tokens is not None and (not stored or stored.rstrip("/") != authority.rstrip("/")):
+            self._initialized = False
+            raise OAuthFlowError("oauth.authorization_server differs from the stored grant or its issuer is unknown; "
+                                 "run hermes mcp login for this server before reconnecting")
+        if context.oauth_metadata is not None and not issuers_match(str(context.oauth_metadata.issuer), authority):
+            context.oauth_metadata = None  # Rediscover; never refresh against stale endpoints.
+        context.auth_server_url = authority
+
+    def _require_authority_metadata(self) -> None:
+        if self._hermes_authorization_server and self.context.oauth_metadata is None:
+            from mcp.client.auth.exceptions import OAuthFlowError
+            self._initialized = False
+            raise OAuthFlowError("No metadata for oauth.authorization_server; refusing a guessed refresh endpoint")
+
     async def _perform_authorization(self):
+        self._require_authority_metadata()
         info = self.context.client_info
         grants = getattr(info, "grant_types", None) or []
         if (getattr(self, "_hermes_oauth_flow", "browser") == "device"
@@ -168,6 +222,8 @@ class HermesProviderMixin:
         untouched, so the SEP-2352 credential binding still uses the advertised identifier (stable across
         runs), while the RFC 9207 ``iss`` check and Hermes' refresh-token binding use the document's issuer.
         Every other response goes back to the SDK unchanged, including its issuer check."""
+        if self._hermes_authorization_server:
+            return response  # Explicit pins use the SDK's exact issuer check, never compatibility exceptions.
         # This compatibility shim is only for authorization-server metadata
         # responses. Never consume arbitrary 200 responses here: MCP resource
         # responses may be long-lived SSE streams (for example GET /v2/mcp),
@@ -270,7 +326,7 @@ class HermesProviderMixin:
                             raise _with_discovery_context(exc, discovery_failures) from exc
                         raise
                     if out is not request:
-                        stamp_default_user_agent(out)
+                        self._prepare_auth_request(out)
                     # Full bidirectional delegation: the SDK drives this flow with
                     # asend(response), so `async for` would swallow the response and
                     # feed the inner generator None. Async generators have no
@@ -289,7 +345,15 @@ class HermesProviderMixin:
                         elif getattr(sent, "status_code", None) == 200:
                             sent = await self._hermes_accept_origin_issued_metadata(sent)
             finally:
-                await self._hermes_release_refresh_fence()
+                try:
+                    await inner.aclose()
+                finally:
+                    await self._hermes_release_refresh_fence()
+
+    def _prepare_auth_request(self, request) -> None:
+        if request.method == "POST":
+            self._require_authority_metadata()  # Includes SDK-guessed registration endpoints.
+        stamp_default_user_agent(request)
 
     async def _refresh_token(self):
         """Take the refresh fence, then build the request from the token we own.
@@ -306,6 +370,7 @@ class HermesProviderMixin:
         aborted) by one task, and async_auth_flow cannot interleave two
         refreshes inside one process.
         """
+        self._require_authority_metadata()
         self._coerce_client_secret_post()
         await self._hermes_acquire_refresh_fence()
         try:
@@ -402,6 +467,7 @@ class HermesProviderMixin:
         """
         self.context.current_tokens = tokens
         self.context.update_token_expiry(tokens)
+        self._enforce_authorization_server()
         enforce_refresh_token_issuer(self.context)
         return bool(getattr(self.context.current_tokens, "refresh_token", None))
 
@@ -416,6 +482,7 @@ class HermesProviderMixin:
             meta = storage.load_oauth_metadata()
             if meta is not None:
                 self.context.oauth_metadata = meta
+        self._enforce_authorization_server()
         enforce_refresh_token_issuer(self.context)
 
     async def _store_tokens(self, token_response) -> None:
@@ -617,6 +684,8 @@ def prepare_oauth_config(server_name: str, server_url: str, oauth_config: dict |
     never leak back into the caller's config."""
     from tools import mcp_oauth as mo
     cfg = dict(oauth_config or {})
+    if "authorization_server" in cfg:
+        cfg["authorization_server"] = authorization_server_override(cfg["authorization_server"])
     mo.apply_oauth_provider_defaults(cfg, server_name=server_name, server_url=server_url)
     return cfg, mo.HermesTokenStorage(server_name)
 
@@ -640,4 +709,5 @@ def build_provider_kwargs(cfg: dict, storage: HermesTokenStorage, *, ssh_proxy_h
         "callback_handler": mo._make_callback_waiter(port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))),
         "token_user_agent": mo.token_request_user_agent(cfg),
         "oauth_flow": cfg.get("flow", "browser"),
+        "oauth_authorization_server": cfg.get("authorization_server"),
         **mo.cimd_provider_kwargs(cfg)}

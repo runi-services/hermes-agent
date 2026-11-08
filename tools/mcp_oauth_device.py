@@ -43,10 +43,13 @@ async def _discover(client, provider):
     # RFC 9728 lets a resource advertise several authorization servers; a browser-only
     # server often comes first and the device-code one later, so try each in order.
     servers = [str(url) for url in prm.authorization_servers] if prm else [None]
+    if getattr(provider, "_hermes_authorization_server", None):
+        servers = [provider._select_authorization_server(servers)]
     failures = []
     for auth_server_url in servers:
         try:
-            metadata = await _device_metadata(client, context.server_url, auth_server_url)
+            metadata = await _device_metadata(client, context.server_url, auth_server_url,
+                                              strict_issuer=bool(getattr(provider, "_hermes_authorization_server", None)))
         except (RuntimeError, OAuthFlowError, ValueError) as exc:
             failures.append((auth_server_url, exc))
             continue
@@ -59,7 +62,7 @@ async def _discover(client, provider):
                        + "; ".join(f"{url}: {exc}" for url, exc in failures))
 
 
-async def _device_metadata(client, server_url, auth_server_url):
+async def _device_metadata(client, server_url, auth_server_url, *, strict_issuer=False):
     """Issuer-bound device metadata of one authorization server; raises when it is unusable."""
     from mcp.client.auth.utils import build_oauth_authorization_server_metadata_discovery_urls
 
@@ -73,6 +76,10 @@ async def _device_metadata(client, server_url, auth_server_url):
         if not data.get("device_authorization_endpoint"):
             raise RuntimeError("Server does not advertise device authorization; use --flow browser if supported")
         metadata = DeviceOAuthMetadata.model_validate(data)
+        if strict_issuer:
+            from mcp.client.auth.utils import validate_metadata_issuer
+            validate_metadata_issuer(metadata, auth_server_url)
+            return metadata
         # The advertised identifier reaches here as str(AnyHttpUrl) with a trailing "/" (pydantic
         # normalizes a host-only URL to its root path) while the document issuer keeps the advertised
         # form, so the SDK's exact-string check (RFC 8414 §3.3) would reject Google's issuer
@@ -213,6 +220,7 @@ async def login_device(name, server_url, oauth_config):
     cfg["_resolved_port"] = cfg.get("redirect_port", 8420)
     provider = HermesMCPOAuthProvider(server_url=server_url, server_name=name, storage=storage,
                                      client_metadata=_build_client_metadata(cfg),
+                                     oauth_authorization_server=cfg.get("authorization_server"),
                                      token_user_agent=cfg.get("user_agent"))
     httpx = sdk_httpx()
     try:
@@ -229,6 +237,8 @@ async def login_device(name, server_url, oauth_config):
     try:
         await storage.set_client_info(provider.context.client_info)
         storage.save_oauth_metadata(provider.context.oauth_metadata)
+        from tools.mcp_oauth_provider import bind_issuer_from_context
+        bind_issuer_from_context(provider.context)
         await storage.set_tokens(tokens)
     except OSError:
         storage.restore(previous)

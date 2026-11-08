@@ -1660,6 +1660,15 @@ platform_toolsets:
 #     args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user"]
 #   notion:
 #     url: https://mcp.notion.com/mcp
+#   tenant_api:
+#     url: https://mcp.example.com/mcp
+#     auth: oauth
+#     oauth:
+#       # Optional operator-selected authority; exact issuer checks stay enabled.
+#       # Replace both placeholders with your registered application's values.
+#       authorization_server: "https://login.microsoftonline.com/<tenant-id>/v2.0"
+#       client_id: "<registered-public-client-id>"
+#       flow: device  # optional; requires device authorization support
 #   github:
 #     command: npx
 #     args: ["-y", "@modelcontextprotocol/server-github"]
